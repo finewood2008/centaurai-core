@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-const DEFAULT_RUNTIME_USER_AGENT: &str = concat!("aioncore/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_RUNTIME_USER_AGENT: &str = concat!("centaurai-core/", env!("CARGO_PKG_VERSION"));
 
 pub fn build_http_client(connect_timeout: Duration, timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()

@@ -1,4 +1,4 @@
-//! Top-level agent-readable capability index for the `aioncore` binary.
+//! Top-level agent-readable capability index for the `centaurai-core` binary.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -25,10 +25,10 @@ pub(crate) fn run_capabilities() -> ExitCode {
 fn data() -> Value {
     json!({
         "schema_version": 1,
-        "contract": "agent-facing-aioncore-cli",
+        "contract": "agent-facing-centaurai-core-cli",
         "stability": "stable",
-        "entrypoint": "aioncore capabilities",
-        "purpose": "Top-level index for agent-facing AionCore CLI domains.",
+        "entrypoint": "centaurai-core capabilities",
+        "purpose": "Top-level index for agent-facing CentaurAI Core CLI domains.",
         "output": {
             "stdout": "JSON envelope",
             "stderr": "single stable ..._FAILED error line when output cannot be written",
@@ -64,10 +64,10 @@ fn data() -> Value {
             {
                 "name": "config",
                 "mode": "read-write",
-                "description": "Manage AionUi configuration: assistants, assistant rules, skills, MCP servers, providers, settings, agents, and scheduled tasks.",
+                "description": "Manage CentaurAI configuration: assistants, assistant rules, skills, MCP servers, providers, settings, agents, and scheduled tasks.",
                 "contract": "agent-facing-config-cli",
                 "contract_command": "config capabilities",
-                "invocation": "aioncore config capabilities",
+                "invocation": "centaurai-core config capabilities",
                 "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"],
                 "safety": {
                     "can_write": true,
@@ -78,10 +78,10 @@ fn data() -> Value {
             {
                 "name": "diagnose",
                 "mode": "read-only",
-                "description": "Diagnose a running AionUi installation: backend health, conversations, provider health, MCP, cron, teams, logs, and controlled GET reads.",
+                "description": "Diagnose a running CentaurAI installation: backend health, conversations, provider health, MCP, cron, teams, logs, and controlled GET reads.",
                 "contract": "agent-facing-diagnose-cli",
                 "contract_command": "diagnose capabilities",
-                "invocation": "aioncore diagnose capabilities",
+                "invocation": "centaurai-core diagnose capabilities",
                 "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"],
                 "optional_runtime": ["AIONUI_LOG_DIR"],
                 "safety": {

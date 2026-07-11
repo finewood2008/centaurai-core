@@ -90,7 +90,7 @@ impl AgentSendError {
                 },
             },
             AgentError::Internal(_) => Self::new(
-                "AionUI failed while sending the message",
+                "CentaurAI failed while sending the message",
                 AgentErrorCode::AionuiInternalError,
                 AgentErrorOwnership::Aionui,
                 Some(detail),
@@ -102,7 +102,7 @@ impl AgentSendError {
                 ),
             ),
             AgentError::Forbidden(_) => Self::new(
-                "AionUI blocked the request before it reached the Agent",
+                "CentaurAI blocked the request before it reached the Agent",
                 AgentErrorCode::AionuiPermissionError,
                 AgentErrorOwnership::Aionui,
                 Some(detail),
@@ -343,7 +343,7 @@ impl AgentSendError {
                 None,
             ),
             AcpError::NotConnected => Self::new(
-                "AionUI lost its Agent protocol connection",
+                "CentaurAI lost its Agent protocol connection",
                 AgentErrorCode::UserAgentDisconnected,
                 AgentErrorOwnership::UserAgent,
                 Some(detail),

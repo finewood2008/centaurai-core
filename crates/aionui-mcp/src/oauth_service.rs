@@ -361,7 +361,7 @@ impl McpOAuthService {
             Content-Type: text/html; charset=utf-8\r\n\
             Connection: close\r\n\r\n\
             <html><body><h1>Authorization successful!</h1>\
-            <p>You can close this window and return to AionUi.</p>\
+            <p>You can close this window and return to CentaurAI.</p>\
             </body></html>";
 
         let _ = stream.write_all(response.as_bytes()).await;

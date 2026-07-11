@@ -304,7 +304,7 @@ async fn request_json(
             DiagnoseError::new(
                 DiagnoseErrorCode::HttpRequestFailed,
                 command,
-                "failed to call AionUi backend",
+                "failed to call CentaurAI Core",
             )
             .field("path", path)
         })?;
@@ -314,7 +314,7 @@ async fn request_json(
         DiagnoseError::new(
             DiagnoseErrorCode::ResponseReadFailed,
             command,
-            "failed to read AionUi backend response",
+            "failed to read CentaurAI Core response",
         )
         .field("path", path)
     })?;
@@ -323,7 +323,7 @@ async fn request_json(
         return Err(DiagnoseError::new(
             DiagnoseErrorCode::HttpStatusError,
             command,
-            "AionUi backend returned an error status",
+            "CentaurAI Core returned an error status",
         )
         .field("path", path)
         .field("status", status.as_u16().to_string()));
@@ -337,7 +337,7 @@ async fn request_json(
         DiagnoseError::new(
             DiagnoseErrorCode::ResponseJsonInvalid,
             command,
-            "AionUi backend returned invalid JSON",
+            "CentaurAI Core returned invalid JSON",
         )
         .field("path", path)
     })?;
@@ -356,7 +356,7 @@ fn extract_api_data(value: Value, command: &str) -> Result<Value, DiagnoseError>
     Err(DiagnoseError::new(
         DiagnoseErrorCode::HttpStatusError,
         command,
-        "AionUi backend returned an unsuccessful response",
+        "CentaurAI Core returned an unsuccessful response",
     ))
 }
 
@@ -905,8 +905,12 @@ fn tail_latest_log(
         .max_by_key(|(_, modified)| *modified)
         .map(|(path, _)| path)
         .ok_or_else(|| {
-            DiagnoseError::new(DiagnoseErrorCode::LogNotFound, command, "no *.aioncore.log files found")
-                .field("path", log_dir.display().to_string())
+            DiagnoseError::new(
+                DiagnoseErrorCode::LogNotFound,
+                command,
+                "no CentaurAI Core log files found",
+            )
+            .field("path", log_dir.display().to_string())
         })?;
     let raw = std::fs::read_to_string(&latest).map_err(|_| {
         DiagnoseError::new(DiagnoseErrorCode::LogReadFailed, command, "failed to read log file")
@@ -951,7 +955,7 @@ fn collect_aioncore_logs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> io
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".aioncore.log"))
+            .is_some_and(|name| name.ends_with(".centaurai-core.log") || name.ends_with(".aioncore.log"))
         {
             out.push(path);
         }

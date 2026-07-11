@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 use crate::error::SystemError;
 
-const DEFAULT_REPO: &str = "iOfficeAI/AionUi";
+const DEFAULT_REPO: &str = "finewood2008/centaurai-core";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Service that checks GitHub Releases for available updates.
@@ -87,7 +87,7 @@ impl VersionCheckService {
                 .http_client
                 .get(&url)
                 .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "aioncore")
+                .header("User-Agent", concat!("centaurai-core/", env!("CARGO_PKG_VERSION")))
                 .send()
                 .await
                 .map_err(|e| SystemError::BadGateway(format!("GitHub API request failed: {e}")))?;
@@ -128,6 +128,11 @@ fn resolve_repo(from_request: Option<&str>) -> String {
         && !r.is_empty()
     {
         return r.to_owned();
+    }
+    if let Ok(v) = std::env::var("CENTAURAI_CORE_GITHUB_REPO")
+        && !v.is_empty()
+    {
+        return v;
     }
     if let Ok(v) = std::env::var("AIONUI_GITHUB_REPO")
         && !v.is_empty()

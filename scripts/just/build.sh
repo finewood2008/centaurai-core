@@ -24,13 +24,13 @@ sha256_file() {
 case "$mode" in
     release)
         just _cargo build --release
-        binary="target/release/aioncore"
+        binary="target/release/centaurai-core"
         sum_file="target/.build-sum"
         label="Build"
         ;;
     debug)
         just _cargo build
-        binary="target/debug/aioncore"
+        binary="target/debug/centaurai-core"
         sum_file="target/.build-debug-sum"
         label="Debug build"
         ;;

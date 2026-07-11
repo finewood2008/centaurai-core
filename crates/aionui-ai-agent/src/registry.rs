@@ -1552,7 +1552,7 @@ mod tests {
         let row = AgentMetadataRow {
             id: "632f31d2".to_string(),
             icon: None,
-            name: "Aion CLI".to_string(),
+            name: "CentaurAI Core".to_string(),
             name_i18n: None,
             description: None,
             description_i18n: None,

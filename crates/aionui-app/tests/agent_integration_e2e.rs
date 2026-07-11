@@ -446,7 +446,10 @@ async fn agent_logos_endpoint_returns_backend_to_logo_catalog() {
 
     // Aion CLI has no vendor `backend` (NULL); it must still be keyed by its
     // agent_type ("aionrs") so aionrs conversations resolve a logo.
-    assert_eq!(logo_for("aionrs").as_deref(), Some("/api/assets/logos/brand/aion.svg"));
+    assert_eq!(
+        logo_for("aionrs").as_deref(),
+        Some("/api/assets/logos/brand/centaurai.svg")
+    );
 
     // Every entry carries a non-empty backend + logo, and backends are unique.
     let mut seen = std::collections::HashSet::new();
@@ -475,7 +478,7 @@ async fn agent_logos_endpoint_includes_disabled_and_missing_rows() {
         .repo_handle()
         .upsert(&UpsertAgentMetadataParams {
             id: "logo-only-row",
-            icon: Some("/api/assets/logos/brand/aion.svg"),
+            icon: Some("/api/assets/logos/brand/centaurai.svg"),
             name: "Logo Only",
             name_i18n: None,
             description: None,
@@ -517,7 +520,7 @@ async fn agent_logos_endpoint_includes_disabled_and_missing_rows() {
         entry.is_some(),
         "disabled row with an icon must still appear in the logo catalog"
     );
-    assert_eq!(entry.unwrap()["logo"], "/api/assets/logos/brand/aion.svg");
+    assert_eq!(entry.unwrap()["logo"], "/api/assets/logos/brand/centaurai.svg");
 }
 
 // ── Message flow with mock agent ────────────────────────────────

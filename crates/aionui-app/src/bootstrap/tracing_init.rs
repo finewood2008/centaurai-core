@@ -102,7 +102,7 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
     let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
 
     // Backend file layer — excludes aion_* targets
-    let file_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aioncore.log");
+    let file_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "centaurai-core.log");
     let (non_blocking, backend_guard) = tracing_appender::non_blocking(file_appender);
 
     let backend_file_layer = fmt::layer()
@@ -346,7 +346,7 @@ mod tests {
         let days = std::sync::Arc::new(std::sync::Mutex::new(vec![second_day, first_day]));
         let mut writer = DailyDatedLogWriter::new_with_date_provider(
             tmp.path().to_path_buf(),
-            "aioncore.log",
+            "centaurai-core.log",
             Box::new({
                 let days = std::sync::Arc::clone(&days);
                 move || days.lock().expect("date queue").pop().expect("date")
@@ -357,13 +357,13 @@ mod tests {
         std::io::Write::write_all(&mut writer, b"july 3\n").expect("write second day");
         std::io::Write::flush(&mut writer).expect("flush");
 
-        let first_path = tmp.path().join("2026/07/02/2026-07-02.aioncore.log");
-        let second_path = tmp.path().join("2026/07/03/2026-07-03.aioncore.log");
+        let first_path = tmp.path().join("2026/07/02/2026-07-02.centaurai-core.log");
+        let second_path = tmp.path().join("2026/07/03/2026-07-03.centaurai-core.log");
         assert_eq!(std::fs::read_to_string(first_path).expect("first day log"), "july 2\n");
         assert_eq!(
             std::fs::read_to_string(second_path).expect("second day log"),
             "july 3\n"
         );
-        assert!(!tmp.path().join("2026/07/02/2026-07-03.aioncore.log").exists());
+        assert!(!tmp.path().join("2026/07/02/2026-07-03.centaurai-core.log").exists());
     }
 }

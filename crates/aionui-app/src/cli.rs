@@ -1,4 +1,4 @@
-//! CLI argument definitions for the `aioncore` binary.
+//! CLI argument definitions for the `centaurai-core` binary.
 //!
 //! Kept separate from `main.rs` to isolate the clap surface (struct + enum +
 //! attribute soup) from the runtime entry point. Visibility is `pub(crate)`
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "aioncore", about = "AionUi Backend Server", version)]
+#[command(name = "centaurai-core", about = "CentaurAI Core Server", version)]
 pub(crate) struct Cli {
     /// Host address to listen on.
     #[arg(long, default_value_t = String::from(aionui_common::constants::DEFAULT_HOST))]
@@ -155,7 +155,7 @@ pub(crate) enum DiagnoseCommand {
     Cron(DiagnoseCronArgs),
     /// Inspect team summary.
     Teams(DiagnoseTeamsArgs),
-    /// Read aioncore logs.
+    /// Read centaurai-core logs.
     Logs(DiagnoseLogsArgs),
     /// Controlled HTTP read escape hatch.
     Http(DiagnoseHttpArgs),
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
-        let result = Cli::try_parse_from(["aioncore", "--version"]);
+        let result = Cli::try_parse_from(["centaurai-core", "--version"]);
         let err = match result {
             Ok(_) => panic!("expected --version to exit through clap DisplayVersion"),
             Err(err) => err,
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
         let rendered = err.to_string();
         assert!(
-            rendered.contains("aioncore"),
+            rendered.contains("centaurai-core"),
             "version output should contain binary name, got: {rendered:?}"
         );
         assert!(
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn short_version_flag_uses_workspace_package_version() {
-        let result = Cli::try_parse_from(["aioncore", "-V"]);
+        let result = Cli::try_parse_from(["centaurai-core", "-V"]);
         let err = match result {
             Ok(_) => panic!("expected -V to exit through clap DisplayVersion"),
             Err(err) => err,
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
         let rendered = err.to_string();
         assert!(
-            rendered.contains("aioncore"),
+            rendered.contains("centaurai-core"),
             "version output should contain binary name, got: {rendered:?}"
         );
         assert!(
@@ -584,15 +584,15 @@ mod tests {
     #[test]
     fn prepare_managed_resources_accepts_bundle_out() {
         let cli = Cli::parse_from([
-            "aioncore",
+            "centaurai-core",
             "prepare-managed-resources",
             "--bundle-out",
-            "/tmp/aioncore-bundle",
+            "/tmp/centaurai-core-bundle",
         ]);
 
         match cli.command {
             Some(Command::PrepareManagedResources(args)) => {
-                assert_eq!(args.bundle_out, std::path::Path::new("/tmp/aioncore-bundle"));
+                assert_eq!(args.bundle_out, std::path::Path::new("/tmp/centaurai-core-bundle"));
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
@@ -600,50 +600,50 @@ mod tests {
 
     #[test]
     fn managed_resources_mode_defaults_to_download() {
-        let cli = Cli::parse_from(["aioncore"]);
+        let cli = Cli::parse_from(["centaurai-core"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
     }
 
     #[test]
     fn managed_resources_mode_accepts_download() {
-        let cli = Cli::parse_from(["aioncore", "--managed-resources-mode", "download"]);
+        let cli = Cli::parse_from(["centaurai-core", "--managed-resources-mode", "download"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
     }
 
     #[test]
     fn parent_pid_accepts_positive_integer() {
-        let cli = Cli::parse_from(["aioncore", "--parent-pid", "4242"]);
+        let cli = Cli::parse_from(["centaurai-core", "--parent-pid", "4242"]);
         assert_eq!(cli.parent_pid, Some(4242));
     }
 
     #[test]
     fn dump_prompts_defaults_to_false() {
-        let cli = Cli::parse_from(["aioncore"]);
+        let cli = Cli::parse_from(["centaurai-core"]);
         assert!(!cli.dump_prompts);
     }
 
     #[test]
     fn dump_prompts_accepts_flag() {
-        let cli = Cli::parse_from(["aioncore", "--dump-prompts"]);
+        let cli = Cli::parse_from(["centaurai-core", "--dump-prompts"]);
         assert!(cli.dump_prompts);
     }
 
     #[test]
     fn recover_corrupted_database_flag_defaults_to_false() {
-        let cli = Cli::parse_from(["aioncore"]);
+        let cli = Cli::parse_from(["centaurai-core"]);
         assert!(!cli.recover_corrupted_database);
     }
 
     #[test]
     fn recover_corrupted_database_flag_is_accepted() {
-        let cli = Cli::parse_from(["aioncore", "--recover-corrupted-database"]);
+        let cli = Cli::parse_from(["centaurai-core", "--recover-corrupted-database"]);
         assert!(cli.recover_corrupted_database);
     }
 
     #[test]
     fn command_as_str_returns_clap_subcommand_names() {
         let prepare_args = PrepareManagedResourcesArgs {
-            bundle_out: PathBuf::from("/tmp/aioncore-bundle"),
+            bundle_out: PathBuf::from("/tmp/centaurai-core-bundle"),
         };
 
         let cases = [
@@ -670,74 +670,74 @@ mod tests {
     #[test]
     fn config_cli_accepts_agent_facing_design_command_paths() {
         let commands: &[&[&str]] = &[
-            &["aioncore", "config", "capabilities"],
-            &["aioncore", "config", "context"],
-            &["aioncore", "config", "assistants", "list"],
-            &["aioncore", "config", "assistants", "get"],
-            &["aioncore", "config", "assistants", "create"],
-            &["aioncore", "config", "assistants", "update"],
-            &["aioncore", "config", "assistants", "delete"],
-            &["aioncore", "config", "assistants", "import"],
-            &["aioncore", "config", "assistants", "state"],
-            &["aioncore", "config", "assistants", "rule", "read"],
-            &["aioncore", "config", "assistants", "rule", "write"],
-            &["aioncore", "config", "assistants", "rule", "delete"],
-            &["aioncore", "config", "assistants", "skill", "read"],
-            &["aioncore", "config", "assistants", "skill", "write"],
-            &["aioncore", "config", "assistants", "skill", "delete"],
-            &["aioncore", "config", "skills", "list"],
-            &["aioncore", "config", "skills", "info"],
-            &["aioncore", "config", "skills", "paths"],
-            &["aioncore", "config", "skills", "import"],
-            &["aioncore", "config", "skills", "delete"],
-            &["aioncore", "config", "skills", "scan"],
-            &["aioncore", "config", "mcp", "servers", "list"],
-            &["aioncore", "config", "mcp", "servers", "get"],
-            &["aioncore", "config", "mcp", "servers", "create"],
-            &["aioncore", "config", "mcp", "servers", "update"],
-            &["aioncore", "config", "mcp", "servers", "delete"],
-            &["aioncore", "config", "mcp", "servers", "toggle"],
-            &["aioncore", "config", "mcp", "servers", "import"],
-            &["aioncore", "config", "mcp", "test-connection"],
-            &["aioncore", "config", "mcp", "agent-configs"],
-            &["aioncore", "config", "mcp", "oauth", "check-status"],
-            &["aioncore", "config", "mcp", "oauth", "login"],
-            &["aioncore", "config", "mcp", "oauth", "logout"],
-            &["aioncore", "config", "mcp", "oauth", "authenticated"],
-            &["aioncore", "config", "providers", "list"],
-            &["aioncore", "config", "providers", "create"],
-            &["aioncore", "config", "providers", "update"],
-            &["aioncore", "config", "providers", "delete"],
-            &["aioncore", "config", "providers", "detect-protocol"],
-            &["aioncore", "config", "providers", "fetch-models"],
-            &["aioncore", "config", "providers", "models", "fetch"],
-            &["aioncore", "config", "providers", "health-check"],
-            &["aioncore", "config", "settings", "get"],
-            &["aioncore", "config", "settings", "patch"],
-            &["aioncore", "config", "settings", "client", "get"],
-            &["aioncore", "config", "settings", "client", "put"],
-            &["aioncore", "config", "agents", "list"],
-            &["aioncore", "config", "agents", "enable"],
-            &["aioncore", "config", "agents", "overrides", "get"],
-            &["aioncore", "config", "agents", "overrides", "set"],
-            &["aioncore", "config", "agents", "custom", "create"],
-            &["aioncore", "config", "agents", "custom", "update"],
-            &["aioncore", "config", "agents", "custom", "delete"],
-            &["aioncore", "config", "agents", "custom", "try-connect"],
-            &["aioncore", "config", "cron", "jobs", "list"],
-            &["aioncore", "config", "cron", "jobs", "get"],
-            &["aioncore", "config", "cron", "jobs", "create"],
-            &["aioncore", "config", "cron", "jobs", "update"],
-            &["aioncore", "config", "cron", "jobs", "delete"],
-            &["aioncore", "config", "cron", "jobs", "run"],
-            &["aioncore", "config", "cron", "jobs", "skill", "get"],
-            &["aioncore", "config", "cron", "jobs", "skill", "save"],
-            &["aioncore", "config", "cron", "jobs", "skill", "delete"],
-            &["aioncore", "config", "skills", "external-paths", "list"],
-            &["aioncore", "config", "skills", "external-paths", "add"],
-            &["aioncore", "config", "skills", "external-paths", "remove"],
-            &["aioncore", "config", "skills", "market", "enable"],
-            &["aioncore", "config", "skills", "market", "disable"],
+            &["centaurai-core", "config", "capabilities"],
+            &["centaurai-core", "config", "context"],
+            &["centaurai-core", "config", "assistants", "list"],
+            &["centaurai-core", "config", "assistants", "get"],
+            &["centaurai-core", "config", "assistants", "create"],
+            &["centaurai-core", "config", "assistants", "update"],
+            &["centaurai-core", "config", "assistants", "delete"],
+            &["centaurai-core", "config", "assistants", "import"],
+            &["centaurai-core", "config", "assistants", "state"],
+            &["centaurai-core", "config", "assistants", "rule", "read"],
+            &["centaurai-core", "config", "assistants", "rule", "write"],
+            &["centaurai-core", "config", "assistants", "rule", "delete"],
+            &["centaurai-core", "config", "assistants", "skill", "read"],
+            &["centaurai-core", "config", "assistants", "skill", "write"],
+            &["centaurai-core", "config", "assistants", "skill", "delete"],
+            &["centaurai-core", "config", "skills", "list"],
+            &["centaurai-core", "config", "skills", "info"],
+            &["centaurai-core", "config", "skills", "paths"],
+            &["centaurai-core", "config", "skills", "import"],
+            &["centaurai-core", "config", "skills", "delete"],
+            &["centaurai-core", "config", "skills", "scan"],
+            &["centaurai-core", "config", "mcp", "servers", "list"],
+            &["centaurai-core", "config", "mcp", "servers", "get"],
+            &["centaurai-core", "config", "mcp", "servers", "create"],
+            &["centaurai-core", "config", "mcp", "servers", "update"],
+            &["centaurai-core", "config", "mcp", "servers", "delete"],
+            &["centaurai-core", "config", "mcp", "servers", "toggle"],
+            &["centaurai-core", "config", "mcp", "servers", "import"],
+            &["centaurai-core", "config", "mcp", "test-connection"],
+            &["centaurai-core", "config", "mcp", "agent-configs"],
+            &["centaurai-core", "config", "mcp", "oauth", "check-status"],
+            &["centaurai-core", "config", "mcp", "oauth", "login"],
+            &["centaurai-core", "config", "mcp", "oauth", "logout"],
+            &["centaurai-core", "config", "mcp", "oauth", "authenticated"],
+            &["centaurai-core", "config", "providers", "list"],
+            &["centaurai-core", "config", "providers", "create"],
+            &["centaurai-core", "config", "providers", "update"],
+            &["centaurai-core", "config", "providers", "delete"],
+            &["centaurai-core", "config", "providers", "detect-protocol"],
+            &["centaurai-core", "config", "providers", "fetch-models"],
+            &["centaurai-core", "config", "providers", "models", "fetch"],
+            &["centaurai-core", "config", "providers", "health-check"],
+            &["centaurai-core", "config", "settings", "get"],
+            &["centaurai-core", "config", "settings", "patch"],
+            &["centaurai-core", "config", "settings", "client", "get"],
+            &["centaurai-core", "config", "settings", "client", "put"],
+            &["centaurai-core", "config", "agents", "list"],
+            &["centaurai-core", "config", "agents", "enable"],
+            &["centaurai-core", "config", "agents", "overrides", "get"],
+            &["centaurai-core", "config", "agents", "overrides", "set"],
+            &["centaurai-core", "config", "agents", "custom", "create"],
+            &["centaurai-core", "config", "agents", "custom", "update"],
+            &["centaurai-core", "config", "agents", "custom", "delete"],
+            &["centaurai-core", "config", "agents", "custom", "try-connect"],
+            &["centaurai-core", "config", "cron", "jobs", "list"],
+            &["centaurai-core", "config", "cron", "jobs", "get"],
+            &["centaurai-core", "config", "cron", "jobs", "create"],
+            &["centaurai-core", "config", "cron", "jobs", "update"],
+            &["centaurai-core", "config", "cron", "jobs", "delete"],
+            &["centaurai-core", "config", "cron", "jobs", "run"],
+            &["centaurai-core", "config", "cron", "jobs", "skill", "get"],
+            &["centaurai-core", "config", "cron", "jobs", "skill", "save"],
+            &["centaurai-core", "config", "cron", "jobs", "skill", "delete"],
+            &["centaurai-core", "config", "skills", "external-paths", "list"],
+            &["centaurai-core", "config", "skills", "external-paths", "add"],
+            &["centaurai-core", "config", "skills", "external-paths", "remove"],
+            &["centaurai-core", "config", "skills", "market", "enable"],
+            &["centaurai-core", "config", "skills", "market", "disable"],
         ];
 
         for command in commands {
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn prepare_managed_resources_requires_bundle_out() {
-        let err = match Cli::try_parse_from(["aioncore", "prepare-managed-resources"]) {
+        let err = match Cli::try_parse_from(["centaurai-core", "prepare-managed-resources"]) {
             Ok(_) => panic!("prepare-managed-resources should require --bundle-out"),
             Err(err) => err,
         };

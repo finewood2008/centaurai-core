@@ -1,14 +1,14 @@
-//! E2E coverage for the top-level agent-facing `aioncore capabilities` index.
+//! E2E coverage for the top-level agent-facing `centaurai-core capabilities` index.
 
 use tokio::process::Command;
 
-fn aioncore_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_aioncore"))
+fn centaurai_core_command() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_centaurai-core"))
 }
 
 #[tokio::test]
 async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
-    let output = aioncore_command()
+    let output = centaurai_core_command()
         .arg("capabilities")
         .env_remove("AIONUI_BASE_URL")
         .env_remove("AIONUI_CONVERSATION_ID")
@@ -33,8 +33,8 @@ async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["success"], true);
     assert_eq!(stdout["meta"]["schema_version"], 1);
-    assert_eq!(stdout["data"]["contract"], "agent-facing-aioncore-cli");
-    assert_eq!(stdout["data"]["entrypoint"], "aioncore capabilities");
+    assert_eq!(stdout["data"]["contract"], "agent-facing-centaurai-core-cli");
+    assert_eq!(stdout["data"]["entrypoint"], "centaurai-core capabilities");
     assert_eq!(stdout["data"]["runtime_context"]["primary"], "AIONUI_CONVERSATION_ID");
 
     let domains = stdout["data"]["domains"]
@@ -46,7 +46,7 @@ async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
         .expect("config domain should be advertised");
     assert_eq!(config["mode"], "read-write");
     assert_eq!(config["contract_command"], "config capabilities");
-    assert_eq!(config["invocation"], "aioncore config capabilities");
+    assert_eq!(config["invocation"], "centaurai-core config capabilities");
 
     let diagnose = domains
         .iter()
@@ -54,5 +54,5 @@ async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
         .expect("diagnose domain should be advertised");
     assert_eq!(diagnose["mode"], "read-only");
     assert_eq!(diagnose["contract_command"], "diagnose capabilities");
-    assert_eq!(diagnose["invocation"], "aioncore diagnose capabilities");
+    assert_eq!(diagnose["invocation"], "centaurai-core diagnose capabilities");
 }
