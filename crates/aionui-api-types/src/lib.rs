@@ -15,6 +15,7 @@ mod conversation;
 mod core_capabilities;
 mod cron;
 mod custom_agent;
+mod decision;
 mod device;
 mod extension;
 mod file;
@@ -99,6 +100,13 @@ pub use cron::{
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
+};
+pub use decision::{
+    BrainDefinition, BrainKind, CreateDecisionRequest, DecisionActionItemInput, DecisionActionItemResponse,
+    DecisionBrainResponse, DecisionBrainState, DecisionCandidateResponse, DecisionEvidenceInput,
+    DecisionEvidenceLocator, DecisionEvidenceResponse, DecisionResolutionResponse, DecisionResponse,
+    DecisionSessionResponse, DecisionStatus, DecisionToolDefinition, DecisionTurnResponse, InterjectDecisionRequest,
+    RefreshDecisionKnowledgeRequest, RoleDefinition, SelectDecisionCandidateRequest, UpdateDecisionRequest,
 };
 pub use device::{
     CreateDevicePairingRequest, DevicePairingSessionResponse, DeviceResponse, PairedDeviceCredentialResponse,

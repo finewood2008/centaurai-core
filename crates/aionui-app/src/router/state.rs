@@ -23,6 +23,10 @@ use aionui_db::{
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
+use aionui_decision::{
+    DecisionKnowledgePort, DecisionRepository, DecisionRouterState, DecisionService, NoopDecisionKnowledge,
+    ProviderBrainRuntime,
+};
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -50,7 +54,7 @@ use aionui_team::{
 };
 
 use crate::config::derive_encryption_key;
-use crate::router::knowledge_adapter::AppModelLocationResolver;
+use crate::router::knowledge_adapter::{AppDecisionKnowledge, AppModelLocationResolver};
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
@@ -121,6 +125,7 @@ pub struct ModuleStates {
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
     pub knowledge: KnowledgeRouterState,
+    pub decision: DecisionRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -250,6 +255,15 @@ pub async fn build_module_states(
                 .with_source(error)
         })?,
     );
+    let decision =
+        build_decision_state_with_knowledge(services, Arc::new(AppDecisionKnowledge::new(knowledge_gateway.clone())));
+    decision.service.recover_interrupted().await.map_err(|error| {
+        RouterBuildError::new(
+            "router.decision.recover",
+            "failed to recover interrupted decision sessions",
+        )
+        .with_source(error)
+    })?;
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -303,6 +317,7 @@ pub async fn build_module_states(
         knowledge: KnowledgeRouterState {
             gateway: knowledge_gateway,
         },
+        decision,
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -315,6 +330,33 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+/// Build the persisted multi-brain decision state from the shared provider catalog.
+pub fn build_decision_state(services: &AppServices) -> DecisionRouterState {
+    build_decision_state_with_knowledge(services, Arc::new(NoopDecisionKnowledge))
+}
+
+/// Build decisions with an application-owned retrieval boundary. Production
+/// uses this path so citations can only originate from the Knowledge Gateway.
+pub fn build_decision_state_with_knowledge(
+    services: &AppServices,
+    knowledge: Arc<dyn DecisionKnowledgePort>,
+) -> DecisionRouterState {
+    let provider_repo: Arc<dyn IProviderRepository> =
+        Arc::new(SqliteProviderRepository::new(services.database.pool().clone()));
+    let runtime = Arc::new(ProviderBrainRuntime::new(
+        provider_repo,
+        derive_encryption_key(&services.jwt_secret_raw),
+    ));
+    let service = DecisionService::new_with_knowledge(
+        DecisionRepository::new(services.database.pool().clone()),
+        runtime.clone(),
+        runtime,
+        services.event_bus.clone(),
+        knowledge,
+    );
+    DecisionRouterState { service }
 }
 
 /// Build the default `AssistantRouterState` from application services.

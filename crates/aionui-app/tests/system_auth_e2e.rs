@@ -137,3 +137,25 @@ async fn auth_required_fetch_models() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn auth_required_list_decisions() {
+    let (app, _) = build_app().await;
+    let resp = app.oneshot(get_request("/api/decisions")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn csrf_required_create_decision() {
+    let (app, _) = build_app().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/decisions")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"question":"Should we ship?","brain_count":3}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
