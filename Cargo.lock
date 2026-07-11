@@ -642,6 +642,7 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "junction",
+ "libc",
  "mime_guess",
  "notify",
  "semver",

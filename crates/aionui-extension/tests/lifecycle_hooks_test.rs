@@ -6,7 +6,7 @@
 //! and graceful handling of missing scripts.
 
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 use aionui_extension::{HookKind, LifecycleHooks, execute_hook, needs_install_hook, resolve_hook_path};
 use tempfile::TempDir;
@@ -15,23 +15,28 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a shell script at `dir/path` with the given body and make it executable.
-fn write_script(dir: &Path, rel_path: &str, body: &str) {
-    let full = dir.join(rel_path);
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    let content = format!("#!/bin/sh\n{body}\n");
-    fs::write(&full, content).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+/// Return a committed executable fixture. Unlike a freshly written temporary
+/// executable, this cannot race with `execve` and yield Linux `ETXTBSY` under
+/// a highly parallel workspace test run.
+fn fixture_script(name: &str) -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/lifecycle")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn setup_ext_dir() -> TempDir {
     tempfile::tempdir().unwrap()
+}
+
+#[cfg(unix)]
+fn write_fresh_script(dir: &std::path::Path, rel_path: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let full = dir.join(rel_path);
+    fs::write(&full, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -41,15 +46,10 @@ fn setup_ext_dir() -> TempDir {
 #[tokio::test]
 async fn lh1_first_install_executes_on_install() {
     let dir = setup_ext_dir();
-    let marker = dir.path().join("installed.marker");
-    write_script(
-        dir.path(),
-        "scripts/install.sh",
-        &format!("touch '{}'", marker.display()),
-    );
+    let marker = dir.path().join("hook.marker");
 
     let hooks = LifecycleHooks {
-        on_install: Some("scripts/install.sh".into()),
+        on_install: Some(fixture_script("marker.sh")),
         ..Default::default()
     };
 
@@ -58,7 +58,7 @@ async fn lh1_first_install_executes_on_install() {
 
     let hook_path = resolve_hook_path(&hooks, HookKind::OnInstall).unwrap();
     let result = execute_hook(dir.path(), hook_path, HookKind::OnInstall, "test-ext").await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "onInstall hook failed: {result:?}");
     assert!(marker.exists(), "onInstall marker file should be created");
 }
 
@@ -69,15 +69,10 @@ async fn lh1_first_install_executes_on_install() {
 #[tokio::test]
 async fn lh2_version_change_executes_on_install() {
     let dir = setup_ext_dir();
-    let marker = dir.path().join("upgraded.marker");
-    write_script(
-        dir.path(),
-        "scripts/install.sh",
-        &format!("touch '{}'", marker.display()),
-    );
+    let marker = dir.path().join("hook.marker");
 
     let hooks = LifecycleHooks {
-        on_install: Some("scripts/install.sh".into()),
+        on_install: Some(fixture_script("marker.sh")),
         ..Default::default()
     };
 
@@ -86,7 +81,7 @@ async fn lh2_version_change_executes_on_install() {
 
     let hook_path = resolve_hook_path(&hooks, HookKind::OnInstall).unwrap();
     let result = execute_hook(dir.path(), hook_path, HookKind::OnInstall, "test-ext").await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "upgrade onInstall hook failed: {result:?}");
     assert!(marker.exists(), "onInstall marker should be created on upgrade");
 }
 
@@ -107,15 +102,9 @@ fn lh2_same_version_skips_install() {
 async fn lh3_activate_executes_on_activate() {
     let dir = setup_ext_dir();
     let counter_file = dir.path().join("activate_count.txt");
-    // Append a line on each activation to count calls
-    write_script(
-        dir.path(),
-        "scripts/activate.sh",
-        &format!("echo 'activated' >> '{}'", counter_file.display()),
-    );
 
     let hooks = LifecycleHooks {
-        on_activate: Some("scripts/activate.sh".into()),
+        on_activate: Some(fixture_script("activate.sh")),
         ..Default::default()
     };
 
@@ -141,21 +130,16 @@ async fn lh3_activate_executes_on_activate() {
 #[tokio::test]
 async fn lh4_deactivate_executes_on_deactivate() {
     let dir = setup_ext_dir();
-    let marker = dir.path().join("deactivated.marker");
-    write_script(
-        dir.path(),
-        "scripts/deactivate.sh",
-        &format!("touch '{}'", marker.display()),
-    );
+    let marker = dir.path().join("hook.marker");
 
     let hooks = LifecycleHooks {
-        on_deactivate: Some("scripts/deactivate.sh".into()),
+        on_deactivate: Some(fixture_script("marker.sh")),
         ..Default::default()
     };
 
     let hook_path = resolve_hook_path(&hooks, HookKind::OnDeactivate).unwrap();
     let result = execute_hook(dir.path(), hook_path, HookKind::OnDeactivate, "test-ext").await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "onDeactivate hook failed: {result:?}");
     assert!(marker.exists(), "onDeactivate marker should be created");
 }
 
@@ -166,16 +150,14 @@ async fn lh4_deactivate_executes_on_deactivate() {
 #[tokio::test]
 async fn lh5_hook_timeout() {
     let dir = setup_ext_dir();
-    // Script that sleeps for a long time
-    write_script(dir.path(), "scripts/slow.sh", "sleep 120");
+    let script_path = fixture_script("slow.sh");
 
     // We can't easily override the built-in timeout constants in the public API,
     // so we test the timeout mechanism by using tokio::time::timeout directly
     // to simulate what execute_hook does internally with a very short deadline.
-    let script_path = dir.path().join("scripts/slow.sh");
-    assert!(script_path.exists());
+    assert!(PathBuf::from(&script_path).exists());
 
-    let child_future = tokio::process::Command::new(&script_path)
+    let child_future = tokio::process::Command::new(script_path)
         .current_dir(dir.path())
         .kill_on_drop(true)
         .output();
@@ -232,9 +214,9 @@ fn resolve_hook_path_none_when_not_declared() {
 #[tokio::test]
 async fn hook_nonzero_exit_returns_hook_failed() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "scripts/fail.sh", "echo 'setup failed' >&2; exit 42");
+    let hook_path = fixture_script("fail.sh");
 
-    let result = execute_hook(dir.path(), "scripts/fail.sh", HookKind::OnInstall, "failing-ext").await;
+    let result = execute_hook(dir.path(), &hook_path, HookKind::OnInstall, "failing-ext").await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -259,10 +241,10 @@ async fn hook_nonzero_exit_returns_hook_failed() {
 #[tokio::test]
 async fn hook_working_directory_is_ext_dir() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "check_dir.sh", "pwd > cwd_out.txt");
+    let hook_path = fixture_script("cwd.sh");
 
-    let result = execute_hook(dir.path(), "check_dir.sh", HookKind::OnActivate, "cwd-ext").await;
-    assert!(result.is_ok());
+    let result = execute_hook(dir.path(), &hook_path, HookKind::OnActivate, "cwd-ext").await;
+    assert!(result.is_ok(), "working-directory hook failed: {result:?}");
 
     let cwd_file = dir.path().join("cwd_out.txt");
     assert!(cwd_file.exists());
@@ -270,4 +252,19 @@ async fn hook_working_directory_is_ext_dir() {
     let expected = dir.path().canonicalize().unwrap();
     let actual = std::path::Path::new(cwd.trim()).canonicalize().unwrap();
     assert_eq!(actual, expected);
+}
+
+// A newly installed hook may still be momentarily busy when Core starts it.
+// Keep this fresh-write coverage alongside the stable fixtures so the bounded
+// production ETXTBSY retry is exercised under parallel stress runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn freshly_written_hook_executes_successfully() {
+    let dir = setup_ext_dir();
+    write_fresh_script(dir.path(), "fresh.sh", ": > fresh.marker");
+
+    let result = execute_hook(dir.path(), "fresh.sh", HookKind::OnInstall, "fresh-ext").await;
+
+    assert!(result.is_ok(), "freshly written hook failed: {result:?}");
+    assert!(dir.path().join("fresh.marker").exists());
 }

@@ -82,6 +82,34 @@ use super::mode_normalize::normalize_requested_mode;
 const ACP_KILL_GRACE_MS: u64 = 500;
 const OBSERVED_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Mirror legacy mode/model commands for backends whose successful RPC
+/// response is authoritative but which do not emit the corresponding
+/// `session/update` notification.
+///
+/// Hermes applies and persists `session/set_mode` / `session/set_model`
+/// before returning the response, but currently sends no current-mode/model
+/// update afterwards. Without this compatibility bridge every successful
+/// switch waits for ten seconds and is surfaced as a 504. Keep this narrowly
+/// scoped so ACP backends that do advertise observation updates still use the
+/// stricter confirmation path.
+fn apply_authoritative_legacy_config_ack(
+    backend: Option<&str>,
+    session: &mut AcpSession,
+    option_id: &str,
+    value: &str,
+) -> bool {
+    if !backend.is_some_and(|backend| backend.eq_ignore_ascii_case("hermes")) {
+        return false;
+    }
+
+    match option_id {
+        "mode" => session.confirm_mode(ModeId::new(value)),
+        "model" => session.confirm_model(ModelId::new(value)),
+        _ => return false,
+    }
+    true
+}
+
 /// Decompose a child `ExitStatus` (or its absence) into the
 /// `(exit_code, signal)` pair that `AcpError::StartupCrash` /
 /// `AcpError::Disconnected` carry.
@@ -734,7 +762,7 @@ impl AcpAgentManager {
                     method = "session/set_mode",
                     "acp_config_option_command_ack"
                 );
-                self.ensure_session_unchanged(&session_id, "mode").await?;
+                self.confirm_legacy_config_ack(&session_id, "mode", value).await?;
                 self.wait_for_observed_config_option("mode", value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
@@ -764,7 +792,7 @@ impl AcpAgentManager {
                     method = "session/set_model",
                     "acp_config_option_command_ack"
                 );
-                self.ensure_session_unchanged(&session_id, "model").await?;
+                self.confirm_legacy_config_ack(&session_id, "model", value).await?;
                 self.wait_for_observed_config_option("model", value, OBSERVED_CONFIRMATION_TIMEOUT)
                     .await
             }
@@ -775,22 +803,34 @@ impl AcpAgentManager {
         })
     }
 
-    async fn ensure_session_unchanged(&self, session_id: &str, field: &str) -> Result<(), AgentError> {
-        let session = self.session.read().await;
-        if session.session_id() == Some(session_id) {
-            return Ok(());
+    async fn confirm_legacy_config_ack(&self, session_id: &str, field: &str, value: &str) -> Result<(), AgentError> {
+        let mut session = self.session.write().await;
+        if session.session_id() != Some(session_id) {
+            warn!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                config_id = %field,
+                confirmed_session_id = %session_id,
+                active_session_id = ?session.session_id(),
+                "acp_config_option_session_changed"
+            );
+            return Err(AgentError::conflict(
+                "Active ACP session changed while applying config option",
+            ));
         }
-        warn!(
-            conversation_id = %self.params.conversation_id,
-            agent_backend = ?self.params.metadata.backend,
-            config_id = %field,
-            confirmed_session_id = %session_id,
-            active_session_id = ?session.session_id(),
-            "acp_config_option_session_changed"
-        );
-        Err(AgentError::conflict(
-            "Active ACP session changed while applying config option",
-        ))
+
+        if apply_authoritative_legacy_config_ack(self.params.metadata.backend.as_deref(), &mut session, field, value) {
+            self.commit_session_changes(&mut session).await;
+            tracing::info!(
+                conversation_id = %self.params.conversation_id,
+                agent_backend = ?self.params.metadata.backend,
+                config_id = %field,
+                confirmed = %value,
+                "acp_config_option_authoritative_command_ack_applied"
+            );
+        }
+
+        Ok(())
     }
 
     async fn wait_for_observed_config_option(
@@ -1342,7 +1382,9 @@ impl AcpAgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_acp_final_input_dump_value, exit_status_parts, user_facing_message};
+    use super::{
+        apply_authoritative_legacy_config_ack, build_acp_final_input_dump_value, exit_status_parts, user_facing_message,
+    };
     use crate::agent_runtime::AgentRuntime;
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
@@ -1469,6 +1511,76 @@ mod tests {
     fn rate_limited_has_no_colon_returns_full_string() {
         let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn hermes_legacy_mode_ack_updates_observed_snapshot_without_notification() {
+        let mut session = AcpSession::new(None, None, Default::default());
+        session.apply_observed_mode(ModeId::new("default"));
+        session.drain_events();
+
+        assert!(apply_authoritative_legacy_config_ack(
+            Some("hermes"),
+            &mut session,
+            "mode",
+            "accept_edits",
+        ));
+
+        assert_eq!(session.observed_mode(), Some("accept_edits"));
+        assert_eq!(session.current_mode_id().as_deref(), Some("accept_edits"));
+        assert_eq!(
+            session.config_snapshot().option_current("mode").as_deref(),
+            Some("accept_edits")
+        );
+        assert_eq!(
+            session.drain_events(),
+            vec![crate::manager::acp::AcpSessionEvent::ObservedModeSynced {
+                mode: ModeId::new("accept_edits"),
+            }]
+        );
+    }
+
+    #[test]
+    fn hermes_legacy_model_ack_updates_observed_snapshot_without_notification() {
+        let mut session = AcpSession::new(None, None, Default::default());
+        session.apply_observed_model(crate::shared_kernel::ModelId::new("openrouter:old-model"));
+        session.drain_events();
+
+        assert!(apply_authoritative_legacy_config_ack(
+            Some("hermes"),
+            &mut session,
+            "model",
+            "openrouter:new-model",
+        ));
+
+        assert_eq!(session.observed_model(), Some("openrouter:new-model"));
+        assert_eq!(session.current_model_id().as_deref(), Some("openrouter:new-model"));
+        assert_eq!(
+            session.config_snapshot().option_current("model").as_deref(),
+            Some("openrouter:new-model")
+        );
+        assert_eq!(
+            session.drain_events(),
+            vec![crate::manager::acp::AcpSessionEvent::ObservedModelSynced {
+                model: crate::shared_kernel::ModelId::new("openrouter:new-model"),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_hermes_legacy_ack_still_requires_observed_notification() {
+        let mut session = AcpSession::new(None, None, Default::default());
+        session.apply_observed_mode(ModeId::new("default"));
+        session.drain_events();
+
+        assert!(!apply_authoritative_legacy_config_ack(
+            Some("claude"),
+            &mut session,
+            "mode",
+            "auto",
+        ));
+        assert_eq!(session.observed_mode(), Some("default"));
+        assert!(session.drain_events().is_empty());
     }
 
     #[test]
