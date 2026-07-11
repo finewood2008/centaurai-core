@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
@@ -29,6 +30,13 @@ pub type AgentFactory =
 /// The trait is object-safe for dependency injection.
 #[async_trait]
 pub trait IWorkerTaskManager: Send + Sync {
+    /// Apply the administrator's resident-task pool policy.
+    fn configure_resident_policy(&self, _task_limit: usize, _idle_timeout_ms: TimestampMs) {}
+
+    fn resident_idle_timeout_ms(&self) -> TimestampMs {
+        180_000
+    }
+
     /// Get an existing task by conversation ID.
     fn get_task(&self, conversation_id: &str) -> Option<AgentInstance>;
 
@@ -88,6 +96,10 @@ pub struct WorkerTaskManagerImpl {
     tasks: DashMap<String, TaskSlot>,
     factory: AgentFactory,
     active_leases: Arc<ActiveLeaseRegistry>,
+    capacity_lock: tokio::sync::Mutex<()>,
+    building_count: AtomicUsize,
+    resident_task_limit: AtomicUsize,
+    resident_idle_timeout_ms: AtomicI64,
 }
 
 impl WorkerTaskManagerImpl {
@@ -100,6 +112,10 @@ impl WorkerTaskManagerImpl {
             tasks: DashMap::new(),
             factory,
             active_leases,
+            capacity_lock: tokio::sync::Mutex::new(()),
+            building_count: AtomicUsize::new(0),
+            resident_task_limit: AtomicUsize::new(6),
+            resident_idle_timeout_ms: AtomicI64::new(180_000),
         }
     }
 
@@ -113,10 +129,98 @@ impl WorkerTaskManagerImpl {
     fn initialised_managed_task(&self, conversation_id: &str) -> Option<ManagedAgentTask> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
     }
+
+    fn memory_used_percent() -> Option<f32> {
+        if let Ok(value) = std::env::var("AIONUI_MEMORY_USED_PERCENT")
+            && let Ok(percent) = value.parse::<f32>()
+        {
+            return Some(percent.clamp(0.0, 100.0));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let mut total = None;
+            let mut available = None;
+            for line in content.lines() {
+                let mut fields = line.split_whitespace();
+                match fields.next() {
+                    Some("MemTotal:") => total = fields.next().and_then(|value| value.parse::<f64>().ok()),
+                    Some("MemAvailable:") => available = fields.next().and_then(|value| value.parse::<f64>().ok()),
+                    _ => {}
+                }
+            }
+            let total = total?;
+            let available = available?;
+            return Some((((total - available) / total) * 100.0).clamp(0.0, 100.0) as f32);
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    fn idle_lru_candidates(&self, requested_id: &str) -> Vec<(String, TimestampMs)> {
+        let mut candidates = self
+            .tasks
+            .iter()
+            .filter_map(|entry| {
+                if entry.key() == requested_id {
+                    return None;
+                }
+                let agent = &entry.value().get()?.agent;
+                matches!(agent.status(), None | Some(ConversationStatus::Finished))
+                    .then(|| (entry.key().clone(), agent.last_activity_at()))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, last_activity)| *last_activity);
+        candidates
+    }
+
+    fn enforce_resident_capacity(&self, requested_id: &str) -> Result<(), AgentError> {
+        let memory = Self::memory_used_percent().unwrap_or_default();
+        let configured_limit = self.resident_task_limit.load(Ordering::Acquire).max(1);
+        let limit = if memory >= 75.0 {
+            configured_limit.min(4)
+        } else {
+            configured_limit
+        };
+        let idle = self.idle_lru_candidates(requested_id);
+        if memory >= 85.0 {
+            for (conversation_id, _) in idle {
+                self.kill(&conversation_id, Some(AgentKillReason::IdleTimeout))?;
+            }
+            return Err(AgentError::conflict(
+                "Resident agent startup is paused because system memory usage is high",
+            ));
+        }
+        let current = self.active_count() + self.building_count.load(Ordering::Acquire);
+        if current < limit {
+            return Ok(());
+        }
+        if let Some((conversation_id, _)) = idle.first() {
+            info!(
+                conversation_id,
+                resident_limit = limit,
+                memory_used_percent = memory,
+                "Evicting least-recently-used idle resident agent"
+            );
+            self.kill(conversation_id, Some(AgentKillReason::IdleTimeout))?;
+            return Ok(());
+        }
+        Err(AgentError::conflict("Resident agent pool is at capacity"))
+    }
 }
 
 #[async_trait]
 impl IWorkerTaskManager for WorkerTaskManagerImpl {
+    fn configure_resident_policy(&self, task_limit: usize, idle_timeout_ms: TimestampMs) {
+        self.resident_task_limit.store(task_limit.max(1), Ordering::Release);
+        self.resident_idle_timeout_ms
+            .store(idle_timeout_ms.max(1_000), Ordering::Release);
+    }
+
+    fn resident_idle_timeout_ms(&self) -> TimestampMs {
+        self.resident_idle_timeout_ms.load(Ordering::Acquire)
+    }
+
     fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
         self.initialised_instance(conversation_id)
     }
@@ -154,6 +258,11 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         let runtime_capabilities = options.runtime_capabilities.clone();
         let managed = slot
             .get_or_try_init(|| async move {
+                let capacity_guard = self.capacity_lock.lock().await;
+                self.enforce_resident_capacity(conversation_id)?;
+                self.building_count.fetch_add(1, Ordering::AcqRel);
+                let _reservation = ResidentBuildReservation(&self.building_count);
+                drop(capacity_guard);
                 let agent = factory(options).await?;
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
@@ -286,6 +395,14 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 Some(entry.key().clone())
             })
             .collect()
+    }
+}
+
+struct ResidentBuildReservation<'a>(&'a AtomicUsize);
+
+impl Drop for ResidentBuildReservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -448,6 +565,14 @@ mod tests {
             async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
+    }
+
+    #[test]
+    fn resident_policy_is_runtime_configurable() {
+        let manager = make_manager();
+        manager.configure_resident_policy(3, 45_000);
+        assert_eq!(manager.resident_task_limit.load(Ordering::Acquire), 3);
+        assert_eq!(manager.resident_idle_timeout_ms(), 45_000);
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {

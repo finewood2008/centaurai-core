@@ -5526,7 +5526,13 @@ async fn d9_ensure_session_rebuilds_agents_with_staggered_bounded_parallelism() 
     let team_id = created.id.clone();
     let handle = tokio::spawn(async move { svc_for_task.ensure_session("user1", &team_id).await });
 
-    tokio::time::advance(std::time::Duration::from_secs(120)).await;
+    // Advance in small steps so the spawned rebuild task can register each
+    // stagger and warmup timer before simulated time moves past it. A single
+    // 120s jump races the first poll and can make every warmup appear serial.
+    for _ in 0..120 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
     handle.await.unwrap().unwrap();
 
     let starts = probe.starts();

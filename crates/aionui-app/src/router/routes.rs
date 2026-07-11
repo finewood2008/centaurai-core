@@ -68,7 +68,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let ws_manager = services.ws_manager.clone();
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
-            ws_manager.broadcast_all(event);
+            ws_manager.broadcast_event(event);
         }
     });
 
@@ -146,6 +146,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         local: services.local,
+        proxy_identity: aionui_auth::ProxyIdentityVerifier::from_env(),
     };
 
     // System routes protected by auth middleware

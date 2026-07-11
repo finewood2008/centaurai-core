@@ -90,7 +90,7 @@ pub struct CloneConversationRequest {
 /// Body for `POST /api/conversations/:id/messages`.
 ///
 /// `msg_id` is server-generated — clients must not provide one.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
@@ -125,6 +125,7 @@ pub struct CancelConversationResponse {
 #[serde(rename_all = "snake_case")]
 pub enum ConversationRuntimeStateKind {
     Idle,
+    Queued,
     Starting,
     Running,
     Cancelling,
@@ -140,6 +141,92 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at: Option<TimestampMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_used: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRunStatus {
+    Queued,
+    Dispatching,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunResponse {
+    pub id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub source: String,
+    pub status: AgentRunStatus,
+    pub queue_position: Option<u32>,
+    pub estimated_wait_ms: Option<u64>,
+    pub effective_model: Option<String>,
+    pub fallback_used: bool,
+    pub error_code: Option<String>,
+    pub queued_at: TimestampMs,
+    pub started_at: Option<TimestampMs>,
+    pub finished_at: Option<TimestampMs>,
+}
+
+pub type AgentRunListResponse = Vec<AgentRunResponse>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntimeMode {
+    Off,
+    Shadow,
+    Enforce,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRuntimePolicyResponse {
+    pub mode: AgentRuntimeMode,
+    pub global_active_limit: usize,
+    pub per_user_active_limit: usize,
+    pub per_user_queue_limit: usize,
+    pub global_queue_limit: usize,
+    pub queue_timeout_ms: u64,
+    pub confirmation_timeout_ms: u64,
+    pub resident_task_limit: usize,
+    pub resident_idle_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UpdateAgentRuntimePolicyRequest {
+    pub mode: Option<AgentRuntimeMode>,
+    pub global_active_limit: Option<usize>,
+    pub per_user_active_limit: Option<usize>,
+    pub per_user_queue_limit: Option<usize>,
+    pub global_queue_limit: Option<usize>,
+    pub queue_timeout_ms: Option<u64>,
+    pub confirmation_timeout_ms: Option<u64>,
+    pub resident_task_limit: Option<usize>,
+    pub resident_idle_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentRuntimeStatusResponse {
+    pub memory_used_percent: Option<f32>,
+    pub memory_state: String,
+    pub configured_active_limit: usize,
+    pub effective_active_limit: usize,
+    pub active_count: usize,
+    pub queued_count: usize,
+    pub resident_task_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

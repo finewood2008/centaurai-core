@@ -10,7 +10,7 @@ use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, Re
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
-use aionui_auth::extract_token_from_ws_headers;
+use aionui_auth::{ProxyIdentityVerifier, extract_token_from_ws_headers};
 use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
@@ -36,7 +36,7 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, WsHandlerState};
+use aionui_realtime::{NoopMessageRouter, RealtimeIdentity, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -361,6 +361,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool.clone()))),
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
+        model_route_service: services.model_route_service.clone(),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
@@ -679,6 +680,8 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         acp_session_repo,
     )
     .with_runtime_state(services.conversation_runtime_state.clone())
+    .with_run_scheduler(services.agent_run_scheduler.clone())
+    .with_model_route_resolver(services.model_route_resolver.clone())
     .with_runtime_helper_context(services.runtime_helper_bin(), services.runtime_base_url());
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
@@ -820,16 +823,51 @@ pub async fn build_extension_states(
 /// Build the default `WsHandlerState` from application services.
 pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     if services.local {
+        let proxy_verifier = ProxyIdentityVerifier::from_env();
+        let user_repo = services.user_repo.clone();
         return WsHandlerState {
             manager: services.ws_manager.clone(),
             router: Arc::new(NoopMessageRouter),
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| Some("local".into())),
+            identity_resolver: Arc::new(move |headers, _| {
+                let proxy_verifier = proxy_verifier.clone();
+                let user_repo = user_repo.clone();
+                Box::pin(async move {
+                    if ProxyIdentityVerifier::has_identity_headers(&headers) {
+                        let identity = proxy_verifier.as_ref()?.verify(&headers).ok()?;
+                        let user = user_repo.find_by_id(&identity.user_id).await.ok()??;
+                        return Some(RealtimeIdentity {
+                            user_id: user.id,
+                            is_admin: identity.role == "admin",
+                        });
+                    }
+                    Some(RealtimeIdentity {
+                        user_id: "system_default_user".into(),
+                        is_admin: true,
+                    })
+                })
+            }),
         };
     }
 
     let jwt_service = services.jwt_service.clone();
-    let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    let user_repo = services.user_repo.clone();
+    let token_validator_service = jwt_service.clone();
+    let token_validator = Arc::new(move |token: &str| token_validator_service.verify(token).is_ok());
+    let identity_resolver: aionui_realtime::ConnectionIdentityResolver =
+        Arc::new(move |_: axum::http::HeaderMap, token: String| {
+            let jwt_service = jwt_service.clone();
+            let user_repo = user_repo.clone();
+            Box::pin(async move {
+                let payload = jwt_service.verify(&token).ok()?;
+                let user = user_repo.find_by_id(&payload.user_id).await.ok()??;
+                Some(RealtimeIdentity {
+                    is_admin: user.id == "system_default_user",
+                    user_id: user.id,
+                })
+            })
+        });
 
     let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
 
@@ -838,6 +876,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
         router: Arc::new(NoopMessageRouter),
         token_validator,
         token_extractor,
+        identity_resolver,
     }
 }
 

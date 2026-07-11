@@ -7,12 +7,13 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
-    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ActiveCountResponse, AgentRunListResponse, AgentRuntimePolicyResponse, AgentRuntimeStatusResponse, ApiResponse,
+    ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest, CancelConversationResponse,
+    CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationListResponse, ConversationResponse, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateAgentRuntimePolicyRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -32,6 +33,14 @@ impl From<ConversationError> for ApiError {
             ConversationError::Archived { reason, .. } => ApiError::ConversationArchived(reason),
             ConversationError::BadRequest { reason } => ApiError::BadRequest(reason),
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
+            ConversationError::Capacity { code, reason } => {
+                let status = match code {
+                    "MEMORY_PRESSURE" => StatusCode::SERVICE_UNAVAILABLE,
+                    "RUN_QUEUE_FULL" => StatusCode::TOO_MANY_REQUESTS,
+                    _ => StatusCode::CONFLICT,
+                };
+                ApiError::coded(status, code, reason, None)
+            }
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
             ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
             ConversationError::Unauthorized { reason } => ApiError::Unauthorized(reason),
@@ -108,6 +117,12 @@ impl From<ConversationError> for ApiError {
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
+        .route("/api/agent-runs", get(list_agent_runs))
+        .route(
+            "/api/admin/agent-runtime-policy",
+            get(get_agent_runtime_policy).patch(update_agent_runtime_policy),
+        )
+        .route("/api/admin/agent-runtime-status", get(get_agent_runtime_status))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/associated", get(associated))
@@ -126,6 +141,50 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
+}
+
+async fn list_agent_runs(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<AgentRunListResponse>>, ApiError> {
+    let runs = state.service.list_agent_runs(&user.id).await.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(runs)))
+}
+
+fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("Administrator permission is required".into()))
+    }
+}
+
+async fn get_agent_runtime_policy(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<AgentRuntimePolicyResponse>>, ApiError> {
+    require_admin(&user)?;
+    Ok(Json(ApiResponse::ok(state.service.agent_runtime_policy())))
+}
+
+async fn update_agent_runtime_policy(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<UpdateAgentRuntimePolicyRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AgentRuntimePolicyResponse>>, ApiError> {
+    require_admin(&user)?;
+    let Json(update) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.update_agent_runtime_policy(update).await,
+    )))
+}
+
+async fn get_agent_runtime_status(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<AgentRuntimeStatusResponse>>, ApiError> {
+    require_admin(&user)?;
+    Ok(Json(ApiResponse::ok(state.service.agent_runtime_status().await)))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────

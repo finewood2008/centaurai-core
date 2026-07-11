@@ -1,4 +1,6 @@
+use crate::types::{EventAudience, RealtimeEvent};
 use aionui_api_types::WebSocketMessage;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -12,6 +14,46 @@ use tracing::warn;
 pub trait EventBroadcaster: Send + Sync {
     /// Broadcast an event to all connected WebSocket clients.
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>);
+
+    fn broadcast_to_user(&self, user_id: &str, event: WebSocketMessage<serde_json::Value>) {
+        let _ = user_id;
+        self.broadcast(event);
+    }
+
+    fn broadcast_to_admins(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.broadcast(event);
+    }
+}
+
+/// Adapter that makes every legacy broadcast user-scoped. This lets turn
+/// internals remain unaware of transport audiences while preventing stream
+/// frames from reaching unrelated seats.
+pub struct UserEventBroadcaster {
+    inner: Arc<dyn EventBroadcaster>,
+    user_id: String,
+}
+
+impl UserEventBroadcaster {
+    pub fn new(inner: Arc<dyn EventBroadcaster>, user_id: impl Into<String>) -> Self {
+        Self {
+            inner,
+            user_id: user_id.into(),
+        }
+    }
+}
+
+impl EventBroadcaster for UserEventBroadcaster {
+    fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.inner.broadcast_to_user(&self.user_id, event);
+    }
+
+    fn broadcast_to_user(&self, user_id: &str, event: WebSocketMessage<serde_json::Value>) {
+        self.inner.broadcast_to_user(user_id, event);
+    }
+
+    fn broadcast_to_admins(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.inner.broadcast_to_admins(event);
+    }
 }
 
 /// Default implementation of [`EventBroadcaster`] backed by
@@ -21,7 +63,7 @@ pub trait EventBroadcaster: Send + Sync {
 /// Each `WebSocketManager` connection subscribes to this channel and
 /// forwards received events to its per-connection `mpsc` sender.
 pub struct BroadcastEventBus {
-    tx: broadcast::Sender<WebSocketMessage<serde_json::Value>>,
+    tx: broadcast::Sender<RealtimeEvent>,
 }
 
 impl BroadcastEventBus {
@@ -34,7 +76,7 @@ impl BroadcastEventBus {
     /// Subscribe to receive broadcast events.
     ///
     /// Each WebSocket connection calls this once to get its own receiver.
-    pub fn subscribe(&self) -> broadcast::Receiver<WebSocketMessage<serde_json::Value>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<RealtimeEvent> {
         self.tx.subscribe()
     }
 
@@ -46,9 +88,29 @@ impl BroadcastEventBus {
 
 impl EventBroadcaster for BroadcastEventBus {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.send(RealtimeEvent::global(event));
+    }
+
+    fn broadcast_to_user(&self, user_id: &str, event: WebSocketMessage<serde_json::Value>) {
+        self.send(RealtimeEvent {
+            audience: EventAudience::User(user_id.to_owned()),
+            message: event,
+        });
+    }
+
+    fn broadcast_to_admins(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.send(RealtimeEvent {
+            audience: EventAudience::Admin,
+            message: event,
+        });
+    }
+}
+
+impl BroadcastEventBus {
+    fn send(&self, event: RealtimeEvent) {
         if let Err(e) = self.tx.send(event) {
             warn!(
-                event_name = %e.0.name,
+                event_name = %e.0.message.name,
                 "broadcast failed: no active receivers"
             );
         }

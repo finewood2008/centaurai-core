@@ -29,6 +29,9 @@ pub enum ConversationError {
     #[error("Conversation is busy: {reason}")]
     Busy { reason: String },
 
+    #[error("Agent capacity rejected the run ({code}): {reason}")]
+    Capacity { code: &'static str, reason: String },
+
     #[error("Forbidden: {reason}")]
     Forbidden { reason: String },
 
@@ -106,6 +109,7 @@ impl ConversationError {
             Self::Archived { reason, .. } => AgentError::conversation_archived(reason.clone()),
             Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
             Self::Busy { reason } => AgentError::conflict(reason.clone()),
+            Self::Capacity { reason, .. } => AgentError::conflict(reason.clone()),
             Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
             Self::NotFoundReason { reason } => AgentError::not_found(reason.clone()),
             Self::Unauthorized { reason } => AgentError::unauthorized(reason.clone()),
@@ -141,6 +145,7 @@ impl ConversationError {
             Self::Unauthorized { .. } => "UNAUTHORIZED",
             Self::Forbidden { .. } => "FORBIDDEN",
             Self::Busy { .. } => "CONFLICT",
+            Self::Capacity { code, .. } => code,
             Self::RateLimited => "RATE_LIMITED",
             Self::Internal { .. } | Self::Acp(_) => "INTERNAL_ERROR",
             Self::BadGateway { .. } => "BAD_GATEWAY",

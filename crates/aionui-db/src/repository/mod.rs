@@ -1,5 +1,6 @@
 pub mod acp_session;
 pub mod agent_metadata;
+pub mod agent_run;
 pub mod assistant;
 pub mod channel;
 mod client_preference;
@@ -8,6 +9,7 @@ pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
 pub mod mcp_server;
+pub mod model_route;
 pub mod oauth_token;
 pub mod provider;
 pub mod remote_agent;
@@ -15,6 +17,7 @@ mod settings;
 pub mod skill;
 mod sqlite_acp_session;
 mod sqlite_agent_metadata;
+mod sqlite_agent_run;
 mod sqlite_assistant;
 mod sqlite_channel;
 mod sqlite_client_preference;
@@ -22,6 +25,7 @@ mod sqlite_conversation;
 mod sqlite_cron;
 mod sqlite_diagnostics;
 mod sqlite_mcp_server;
+mod sqlite_model_route;
 mod sqlite_oauth_token;
 mod sqlite_provider;
 mod sqlite_remote_agent;
@@ -34,6 +38,7 @@ mod user;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
+pub use agent_run::{AgentRuntimePolicyRow, CreateAgentRunParams, IAgentRunRepository};
 pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository,
@@ -47,6 +52,10 @@ pub use diagnostics::{
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IFeedbackDiagnosticsRepository,
 };
 pub use mcp_server::IMcpServerRepository;
+pub use model_route::{
+    CreateModelRouteParams, IModelRouteRepository, RecordModelRouteMetricParams, UpdateModelRouteParams,
+    UpsertModelRouteMemberParams,
+};
 pub use oauth_token::IOAuthTokenRepository;
 pub use provider::IProviderRepository;
 pub use remote_agent::IRemoteAgentRepository;
@@ -54,6 +63,7 @@ pub use settings::ISettingsRepository;
 pub use skill::ISkillRepository;
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
+pub use sqlite_agent_run::SqliteAgentRunRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
@@ -64,6 +74,7 @@ pub use sqlite_conversation::SqliteConversationRepository;
 pub use sqlite_cron::SqliteCronRepository;
 pub use sqlite_diagnostics::SqliteFeedbackDiagnosticsRepository;
 pub use sqlite_mcp_server::SqliteMcpServerRepository;
+pub use sqlite_model_route::SqliteModelRouteRepository;
 pub use sqlite_oauth_token::SqliteOAuthTokenRepository;
 pub use sqlite_provider::SqliteProviderRepository;
 pub use sqlite_remote_agent::SqliteRemoteAgentRepository;

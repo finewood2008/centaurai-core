@@ -14,12 +14,12 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteModelRouteRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
 };
 use aionui_system::{
-    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
-    RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ModelRouteService, ProtocolDetectionService,
+    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,11 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
         provider_service: ProviderService::new(provider_repo.clone(), TEST_ENCRYPTION_KEY),
-        model_fetch_service: ModelFetchService::new(provider_repo, TEST_ENCRYPTION_KEY, http_client.clone()),
+        model_fetch_service: ModelFetchService::new(provider_repo.clone(), TEST_ENCRYPTION_KEY, http_client.clone()),
+        model_route_service: ModelRouteService::new(
+            Arc::new(SqliteModelRouteRepository::new(db.pool().clone())),
+            provider_repo,
+        ),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, "0.1.0".to_owned()),
         runtime_prepare_service: RuntimePrepareService::new(Arc::new(BroadcastEventBus::new(16))),
@@ -45,10 +49,17 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     }
 }
 
+fn admin_app(db: &aionui_db::Database) -> axum::Router {
+    system_routes(build_state(db)).layer(axum::Extension(aionui_auth::CurrentUser {
+        id: "system_default_user".into(),
+        username: "admin".into(),
+        is_admin: true,
+    }))
+}
+
 async fn setup() -> (axum::Router, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
-    let state = build_state(&db);
-    (system_routes(state), db)
+    (admin_app(&db), db)
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -88,7 +99,7 @@ fn sample_create_body() -> serde_json::Value {
 
 /// Create a provider and return (response_json, provider_id, fresh_router).
 async fn create_one(db: &aionui_db::Database) -> (serde_json::Value, String) {
-    let app = system_routes(build_state(db));
+    let app = admin_app(db);
     let resp = app
         .oneshot(json_request("POST", "/api/providers", sample_create_body()))
         .await
@@ -119,7 +130,7 @@ async fn list_providers_returns_plaintext_api_key() {
     let (_app, db) = setup().await;
     create_one(&db).await;
 
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2.oneshot(get_request("/api/providers")).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
@@ -162,6 +173,30 @@ async fn create_provider_success() {
 }
 
 #[tokio::test]
+async fn non_admin_lists_only_enabled_logical_routes_without_physical_keys() {
+    let db = init_database_memory().await.unwrap();
+    let (_created, physical_id) = create_one(&db).await;
+    sqlx::query("INSERT INTO model_routes (id, name, enabled, required_capabilities, fallback_after_ms, created_at, updated_at) VALUES ('fast', 'Fast', 1, '[\"function_calling\"]', 15000, 1, 1)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let app = system_routes(build_state(&db)).layer(axum::Extension(aionui_auth::CurrentUser {
+        id: "user-a".into(),
+        username: "alice".into(),
+        is_admin: false,
+    }));
+
+    let response = app.oneshot(get_request("/api/providers")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let providers = body["data"].as_array().unwrap();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0]["id"], "route:fast");
+    assert_eq!(providers[0]["api_key"], "");
+    assert_ne!(providers[0]["id"], physical_id);
+}
+
+#[tokio::test]
 async fn create_provider_with_supplied_id() {
     let (app, _db) = setup().await;
     let body = json!({
@@ -194,14 +229,14 @@ async fn create_provider_with_duplicate_id_returns_conflict() {
         "api_key": "sk-test"
     });
 
-    let app1 = system_routes(build_state(&db));
+    let app1 = admin_app(&db);
     let resp = app1
         .oneshot(json_request("POST", "/api/providers", body.clone()))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2
         .oneshot(json_request("POST", "/api/providers", body))
         .await
@@ -326,7 +361,7 @@ async fn update_provider_name() {
     let (_app, db) = setup().await;
     let (_, id) = create_one(&db).await;
 
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2
         .oneshot(json_request(
             "PUT",
@@ -347,7 +382,7 @@ async fn update_provider_api_key_returns_plaintext() {
     let (_app, db) = setup().await;
     let (_, id) = create_one(&db).await;
 
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2
         .oneshot(json_request(
             "PUT",
@@ -382,7 +417,7 @@ async fn delete_provider_success() {
     let (_app, db) = setup().await;
     let (_, id) = create_one(&db).await;
 
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2
         .oneshot(delete_request(&format!("/api/providers/{id}")))
         .await
@@ -398,14 +433,14 @@ async fn delete_provider_then_list_excludes_deleted() {
     let (_app, db) = setup().await;
     let (_, id) = create_one(&db).await;
 
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2
         .oneshot(delete_request(&format!("/api/providers/{id}")))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let app3 = system_routes(build_state(&db));
+    let app3 = admin_app(&db);
     let resp = app3.oneshot(get_request("/api/providers")).await.unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"], json!([]));
@@ -431,13 +466,13 @@ async fn full_crud_flow() {
     assert_eq!(create_json["data"]["platform"], "anthropic");
 
     // 2. List — should contain one
-    let app2 = system_routes(build_state(&db));
+    let app2 = admin_app(&db);
     let resp = app2.oneshot(get_request("/api/providers")).await.unwrap();
     let list_json = body_json(resp).await;
     assert_eq!(list_json["data"].as_array().unwrap().len(), 1);
 
     // 3. Update
-    let app3 = system_routes(build_state(&db));
+    let app3 = admin_app(&db);
     let resp = app3
         .oneshot(json_request(
             "PUT",
@@ -452,13 +487,13 @@ async fn full_crud_flow() {
     assert!(!update_json["data"]["enabled"].as_bool().unwrap());
 
     // 4. Verify update via list
-    let app4 = system_routes(build_state(&db));
+    let app4 = admin_app(&db);
     let resp = app4.oneshot(get_request("/api/providers")).await.unwrap();
     let list_json = body_json(resp).await;
     assert_eq!(list_json["data"][0]["name"], "Updated");
 
     // 5. Delete
-    let app5 = system_routes(build_state(&db));
+    let app5 = admin_app(&db);
     let resp = app5
         .oneshot(delete_request(&format!("/api/providers/{id}")))
         .await
@@ -466,7 +501,7 @@ async fn full_crud_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // 6. Verify deleted
-    let app6 = system_routes(build_state(&db));
+    let app6 = admin_app(&db);
     let resp = app6.oneshot(get_request("/api/providers")).await.unwrap();
     let list_json = body_json(resp).await;
     assert_eq!(list_json["data"], json!([]));

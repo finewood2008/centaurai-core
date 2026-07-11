@@ -1,6 +1,7 @@
 //! HTTP router assembly for the application.
 
 mod health;
+pub(crate) mod model_route_adapter;
 mod routes;
 mod state;
 mod team_conversation_adapters;

@@ -1,5 +1,6 @@
 mod acp_session;
 mod agent_metadata;
+mod agent_run;
 mod assistant;
 mod channel;
 mod client_preference;
@@ -8,6 +9,7 @@ mod conversation_artifact;
 mod cron_job;
 mod mcp_server;
 mod message;
+mod model_route;
 mod oauth_token;
 mod provider;
 mod remote_agent;
@@ -20,6 +22,7 @@ pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{
     AgentMetadataRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
+pub use agent_run::AgentRunRow;
 pub use assistant::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
     CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
@@ -32,6 +35,7 @@ pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
+pub use model_route::{ConversationModelAssignmentRow, ModelRouteMemberRow, ModelRouteRow};
 pub use oauth_token::OAuthTokenRow;
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
