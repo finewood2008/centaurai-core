@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
 use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router_with_runtime};
+use aionui_knowledge::KnowledgeWorkerSupervisor;
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
 
@@ -215,6 +216,23 @@ pub(crate) async fn run_server(
 ) -> Result<ExitCode, BootstrapError> {
     let boot = Instant::now();
 
+    let knowledge_worker = KnowledgeWorkerSupervisor::start_from_environment(&services.data_dir)
+        .await
+        .map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ServiceInitFailed,
+                "knowledge.worker.start",
+                "failed to start managed knowledge worker",
+            )
+            .with_source(error)
+        })?;
+    if knowledge_worker.is_some() {
+        info!(
+            elapsed_ms = boot.elapsed().as_millis(),
+            "startup: managed knowledge worker ready"
+        );
+    }
+
     let has_users = services.user_repo.has_users().await.map_err(|error| {
         BootstrapError::new(
             BootstrapErrorCode::ServerFailed,
@@ -294,8 +312,9 @@ pub(crate) async fn run_server(
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
+    let knowledge_worker_for_shutdown = knowledge_worker.clone();
 
-    axum::serve(listener, router)
+    let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             match shutdown_signal(parent_exit).await {
                 Err(error) => {
@@ -320,19 +339,42 @@ pub(crate) async fn run_server(
                         Ok(()) => info!(active_task_count, "worker task manager shutdown completed"),
                         Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
                     }
+                    if let Some(supervisor) = knowledge_worker_for_shutdown
+                        && let Err(error) = supervisor.shutdown().await
+                    {
+                        warn!(
+                            code = "BOOTSTRAP_DEGRADED_KNOWLEDGE_WORKER_SHUTDOWN",
+                            stage = "knowledge.worker.shutdown",
+                            error = %error,
+                            "managed knowledge worker shutdown failed"
+                        );
+                    }
                 }
             }
             let _ = shutdown_tx.send(true);
         })
-        .await
-        .map_err(|error| {
-            BootstrapError::new(
-                BootstrapErrorCode::ServerFailed,
-                "server.serve",
-                "server runtime failed",
-            )
-            .with_source(error)
-        })?;
+        .await;
+
+    // Also cover listener/server failures that bypass the signal future.
+    if let Some(supervisor) = knowledge_worker
+        && let Err(error) = supervisor.shutdown().await
+    {
+        warn!(
+            code = "BOOTSTRAP_DEGRADED_KNOWLEDGE_WORKER_SHUTDOWN",
+            stage = "knowledge.worker.shutdown",
+            error = %error,
+            "managed knowledge worker shutdown failed after server exit"
+        );
+    }
+
+    serve_result.map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::ServerFailed,
+            "server.serve",
+            "server runtime failed",
+        )
+        .with_source(error)
+    })?;
 
     let shutdown_error = shutdown_error_rx.await.ok();
 

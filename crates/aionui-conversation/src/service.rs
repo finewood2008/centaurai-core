@@ -722,7 +722,7 @@ impl ConversationService {
             }
         };
         let request = if run.source == "conversation" {
-            serde_json::from_str::<SendMessageRequest>(&run.request_json).ok()
+            deserialize_persisted_send_message_request(&run.request_json)
         } else {
             serde_json::from_str::<serde_json::Value>(&run.request_json)
                 .ok()
@@ -736,6 +736,8 @@ impl ConversationService {
                             .get("user_message_hidden")
                             .and_then(|hidden| hidden.as_bool())
                             .unwrap_or(false),
+                        knowledge: None,
+                        retrieval: None,
                     })
                 })
         };
@@ -827,11 +829,13 @@ impl ConversationService {
         conversation_id: &str,
         msg_id: String,
         turn_id: String,
+        retrieval: Option<aionui_api_types::RetrievalBundle>,
     ) -> SendMessageResponse {
         SendMessageResponse {
             msg_id,
             turn_id,
             runtime: self.runtime_summary_for(conversation_id).await,
+            retrieval,
         }
     }
 
@@ -853,6 +857,44 @@ impl ConversationService {
 
         self.complete_turn(conversation_id, turn_id).await;
     }
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedSendMessageRequest {
+    content: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    inject_skills: Vec<String>,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    knowledge: Option<aionui_api_types::SendMessageKnowledge>,
+    #[serde(default)]
+    retrieval: Option<aionui_api_types::RetrievalBundle>,
+}
+
+fn deserialize_persisted_send_message_request(raw: &str) -> Option<SendMessageRequest> {
+    let persisted: PersistedSendMessageRequest = serde_json::from_str(raw).ok()?;
+    Some(SendMessageRequest {
+        content: persisted.content,
+        files: persisted.files,
+        inject_skills: persisted.inject_skills,
+        hidden: persisted.hidden,
+        knowledge: persisted.knowledge,
+        retrieval: persisted.retrieval,
+    })
+}
+
+fn serialize_user_message_content(request: &SendMessageRequest) -> String {
+    let mut content = serde_json::json!({ "content": request.content });
+    if let (Some(object), Some(retrieval)) = (content.as_object_mut(), request.retrieval.as_ref()) {
+        object.insert(
+            "retrieval".to_owned(),
+            serde_json::to_value(retrieval).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    content.to_string()
 }
 
 // ── Conversation CRUD ───────────────────────────────────────────────
@@ -2812,6 +2854,7 @@ impl ConversationService {
     ) -> Result<SendMessageResponse, ConversationError> {
         scheduler.preflight(user_id).await.map_err(capacity_error)?;
 
+        let retrieval = req.retrieval.clone();
         let turn_id = Self::mint_turn_id();
         let run_id = generate_prefixed_id("run");
         let user_msg_id = Self::mint_msg_id();
@@ -2821,7 +2864,7 @@ impl ConversationService {
             conversation_id: row.id.clone(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
-            content: serde_json::json!({ "content": req.content }).to_string(),
+            content: serialize_user_message_content(&req),
             position: Some("right".into()),
             status: Some("finish".into()),
             hidden: req.hidden,
@@ -2872,6 +2915,7 @@ impl ConversationService {
             msg_id: user_msg_id,
             turn_id: turn_id.clone(),
             runtime: self.runtime_summary_for(&row.id).await,
+            retrieval,
         };
         let service = self.clone();
         tokio::spawn(async move {
@@ -3098,6 +3142,7 @@ impl ConversationService {
                 reason: "Message content must not be empty".into(),
             });
         }
+        let retrieval = req.retrieval.clone();
         let send_started_at = now_ms();
 
         // Verify conversation exists and belongs to user
@@ -3144,7 +3189,7 @@ impl ConversationService {
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
-            content: serde_json::json!({ "content": req.content }).to_string(),
+            content: serialize_user_message_content(&req),
             position: Some("right".into()),
             status: Some("finish".into()),
             hidden: req.hidden,
@@ -3158,7 +3203,9 @@ impl ConversationService {
             let was_deleting = turn_claim.release();
             self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                 .await;
-            return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
+            return Ok(self
+                .send_message_response(conversation_id, user_msg_id, turn_id, retrieval)
+                .await);
         }
         if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
@@ -3205,7 +3252,9 @@ impl ConversationService {
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(conversation_id, &turn_id, was_deleting)
                     .await;
-                return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
+                return Ok(self
+                    .send_message_response(conversation_id, user_msg_id, turn_id, retrieval)
+                    .await);
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
@@ -3232,7 +3281,7 @@ impl ConversationService {
             "Message accepted, agent work scheduled"
         );
         Ok(self
-            .send_message_response(conversation_id, user_msg_id_ret, turn_id)
+            .send_message_response(conversation_id, user_msg_id_ret, turn_id, retrieval)
             .await)
     }
 
@@ -3344,6 +3393,8 @@ impl ConversationService {
                     files: request.files,
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
+                    knowledge: None,
+                    retrieval: None,
                 },
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
@@ -3470,6 +3521,8 @@ impl ConversationService {
             files: request.files.clone(),
             inject_skills: request.inject_skills.clone(),
             hidden: request.user_message_hidden,
+            knowledge: None,
+            retrieval: None,
         };
         let (routed_row, model_lease) = match self
             .acquire_model_route(
@@ -3554,6 +3607,8 @@ impl ConversationService {
                     files: request.files,
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
+                    knowledge: None,
+                    retrieval: None,
                 },
                 required_runtime_mode: request.required_runtime_mode,
                 build_options,
@@ -4843,6 +4898,31 @@ fn is_tool_message_type(message_type: MessageType) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn queued_turn_recovery_preserves_server_retrieval_evidence() {
+        let request = SendMessageRequest {
+            content: "question".into(),
+            files: vec![],
+            inject_skills: vec![],
+            hidden: false,
+            knowledge: None,
+            retrieval: Some(aionui_api_types::RetrievalBundle {
+                query: "question".into(),
+                hits: vec![],
+                token_budget: 0,
+                cloud_authorized: false,
+                space_ids: vec!["personal".into()],
+            }),
+        };
+        let serialized = serde_json::to_string(&request).unwrap();
+        let restored = deserialize_persisted_send_message_request(&serialized).unwrap();
+        assert_eq!(restored.retrieval.unwrap().space_ids, vec!["personal"]);
+
+        let message: serde_json::Value = serde_json::from_str(&serialize_user_message_content(&request)).unwrap();
+        assert_eq!(message["content"], "question");
+        assert_eq!(message["retrieval"]["space_ids"][0], "personal");
+    }
 
     #[test]
     fn enum_to_db_agent_type() {

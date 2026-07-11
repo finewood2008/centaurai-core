@@ -29,6 +29,7 @@ use aionui_extension::{
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{BrowseRoots, FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_knowledge::{KnowledgeGateway, KnowledgeRouterState};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -49,6 +50,7 @@ use aionui_team::{
 };
 
 use crate::config::derive_encryption_key;
+use crate::router::knowledge_adapter::AppModelLocationResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
@@ -118,6 +120,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub knowledge: KnowledgeRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -234,6 +237,19 @@ pub async fn build_module_states(
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let knowledge_gateway = Arc::new(
+        KnowledgeGateway::from_environment(
+            &services.data_dir,
+            Arc::new(AppModelLocationResolver::new(
+                services.conversation_service.clone(),
+                provider_repo.clone(),
+            )),
+        )
+        .map_err(|error| {
+            RouterBuildError::new("router.knowledge.configure", "invalid knowledge worker configuration")
+                .with_source(error)
+        })?,
+    );
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -253,10 +269,11 @@ pub async fn build_module_states(
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
-            build_conversation_state(
+            build_conversation_state_with_knowledge(
                 services,
                 Some(cron.cron_service.clone()),
                 Some(assistant.service.clone() as Arc<dyn AssistantRuleDispatcher>),
+                knowledge_gateway.clone(),
             )
         }),
         remote_agent: build_module_state_phase(&boot, "remote_agent", || build_remote_agent_state(services)),
@@ -283,6 +300,9 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        knowledge: KnowledgeRouterState {
+            gateway: knowledge_gateway,
+        },
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -378,6 +398,20 @@ pub fn build_conversation_state(
     cron_service: Option<Arc<aionui_cron::service::CronService>>,
     assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
 ) -> ConversationRouterState {
+    build_conversation_state_with_knowledge(
+        services,
+        cron_service,
+        assistant_dispatcher,
+        Arc::new(KnowledgeGateway::unavailable()),
+    )
+}
+
+fn build_conversation_state_with_knowledge(
+    services: &AppServices,
+    cron_service: Option<Arc<aionui_cron::service::CronService>>,
+    assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
+    knowledge_gateway: Arc<KnowledgeGateway>,
+) -> ConversationRouterState {
     let conversation_service = services.conversation_service.clone();
     if let Some(dispatcher) = assistant_dispatcher {
         conversation_service.with_assistant_dispatcher(dispatcher);
@@ -389,6 +423,7 @@ pub fn build_conversation_state(
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
         active_leases: services.active_lease_registry.clone(),
+        knowledge_gateway,
     }
 }
 

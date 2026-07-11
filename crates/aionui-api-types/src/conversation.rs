@@ -5,6 +5,7 @@ use aionui_common::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
+use crate::knowledge::{RetrievalBundle, SendMessageKnowledge};
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +100,12 @@ pub struct SendMessageRequest {
     pub inject_skills: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<SendMessageKnowledge>,
+    /// Server-produced retrieval evidence. Client values are always ignored,
+    /// while queued turns serialize this field for crash-safe replay.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalBundle>,
 }
 
 /// Response for `POST /api/conversations/:id/messages`.
@@ -107,6 +114,8 @@ pub struct SendMessageResponse {
     pub msg_id: String,
     pub turn_id: String,
     pub runtime: ConversationRuntimeSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalBundle>,
 }
 
 /// Body for `POST /api/conversations/:id/cancel`.

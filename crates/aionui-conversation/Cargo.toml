@@ -7,6 +7,7 @@ edition.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true
 aionui-api-types.workspace = true
+aionui-knowledge.workspace = true
 aionui-realtime.workspace = true
 aionui-auth.workspace = true
 aionui-ai-agent.workspace = true

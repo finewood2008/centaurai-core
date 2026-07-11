@@ -2,6 +2,7 @@
 
 mod capabilities;
 mod health;
+mod knowledge_adapter;
 pub(crate) mod model_route_adapter;
 mod routes;
 mod state;

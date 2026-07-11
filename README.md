@@ -52,6 +52,32 @@ Clients must omit `api_key` on updates unless the user supplies a new plaintext
 secret. Values beginning with `masked:v1:` are response placeholders and are
 rejected on write.
 
+Knowledge clients also use Core as their only public boundary. Core exposes
+`/api/knowledge/status`, spaces, sources, jobs, search, Wiki, memory, and graph
+resources; it authenticates the owner and calls the private
+`centaurai-knowledge-worker` with `CENTAURAI_KNOWLEDGE_INTERNAL_TOKEN`. The
+preferred transport is the Unix socket configured by
+`CENTAURAI_KNOWLEDGE_WORKER_SOCKET` (defaulting under the Core data directory).
+`CENTAURAI_KNOWLEDGE_WORKER_URL` is an explicit loopback-only fallback and must
+use a literal loopback IP. Client requests cannot override either transport.
+
+An appliance sets `CENTAURAI_CORE_KNOWLEDGE_WORKER_BIN` to an absolute,
+executable Worker path. Core then owns that process: it passes the public Core
+socket setting to the child as `CENTAURAI_KNOWLEDGE_SOCKET`, passes
+`CENTAURAI_KNOWLEDGE_DATA_DIR` and the internal token, waits for Worker
+readiness, restarts crashes with capped exponential backoff, and tears the
+process tree down during Core shutdown. A configured managed binary fails
+closed when its path, token, data directory, or socket is unsafe. Without the
+managed-binary setting, Core can still connect to an independently supervised
+Worker on its fixed private transport.
+
+Conversation message requests may include a `knowledge` policy with `mode`,
+`space_ids`, `max_hits`, and `cloud_use`. Core performs retrieval before model
+dispatch, stores the structured `RetrievalBundle` with the user message, and
+keeps the visible message text separate from the model-only evidence context.
+External or unknown model targets require both per-request authorization and
+an `allowed` cloud policy on every selected knowledge space.
+
 Existing AionCore-compatible integrations are a deliberate compatibility
 target. Changes to REST behavior, WebSocket event names or payloads, the startup
 record, or SQLite data migration require an explicit compatibility review.

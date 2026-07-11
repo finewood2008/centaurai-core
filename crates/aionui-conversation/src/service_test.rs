@@ -3363,6 +3363,58 @@ async fn send_message_returns_accepted() {
 }
 
 #[tokio::test]
+async fn send_message_injects_server_retrieval_only_at_model_dispatch() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        agent.clone(),
+    )]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let mut request = make_send_req();
+    request.retrieval = Some(aionui_api_types::RetrievalBundle {
+        query: "Hello".into(),
+        hits: vec![aionui_api_types::KnowledgeHit {
+            source_id: "source_1".into(),
+            title: "Plan".into(),
+            snippet: "Private beta starts Monday.".into(),
+            score: 0.9,
+            media_type: "pdf".into(),
+            locator: Default::default(),
+        }],
+        token_budget: 16,
+        cloud_authorized: false,
+        space_ids: vec!["personal".into()],
+    });
+
+    let response = svc
+        .send_message("user_1", &conv.id, request, &task_mgr_dyn)
+        .await
+        .unwrap();
+    assert_eq!(response.retrieval.as_ref().unwrap().hits[0].source_id, "source_1");
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let sent = agent.sent_contents();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains("LOCAL_KNOWLEDGE_EVIDENCE_JSON_START"));
+    assert!(sent[0].contains("source_1"));
+    assert!(sent[0].ends_with("Hello\nUSER_REQUEST_END"));
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let user = messages
+        .iter()
+        .find(|message| message.position.as_deref() == Some("right"))
+        .unwrap();
+    let content: serde_json::Value = serde_json::from_str(&user.content).unwrap();
+    assert_eq!(content["content"], "Hello");
+    assert_eq!(content["retrieval"]["hits"][0]["source_id"], "source_1");
+    assert!(!user.content.contains("LOCAL_KNOWLEDGE_EVIDENCE_JSON_START"));
+}
+
+#[tokio::test]
 async fn send_message_injects_conversation_runtime_context() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -4534,6 +4586,8 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 hidden: false,
                 files: vec![],
                 inject_skills: vec![],
+                knowledge: None,
+                retrieval: None,
             },
             &task_mgr,
         )

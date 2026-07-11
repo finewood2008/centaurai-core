@@ -1,0 +1,26 @@
+[package]
+name = "aionui-knowledge"
+version.workspace = true
+edition.workspace = true
+description = "Core-owned gateway for the CentaurAI knowledge worker"
+license.workspace = true
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-common.workspace = true
+aionui-runtime.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower = { workspace = true, features = ["util"] }
+wiremock.workspace = true
+tempfile.workspace = true

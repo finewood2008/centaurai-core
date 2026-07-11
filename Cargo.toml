@@ -5,6 +5,7 @@ members = [
     "crates/aionui-common",
     "crates/aionui-db",
     "crates/aionui-api-types",
+    "crates/aionui-knowledge",
     "crates/aionui-realtime",
     "crates/aionui-runtime",
     "crates/aionui-auth",
@@ -41,6 +42,7 @@ aionui-common = { path = "crates/aionui-common" }
 aionui-assets = { path = "crates/aionui-assets" }
 aionui-db = { path = "crates/aionui-db" }
 aionui-api-types = { path = "crates/aionui-api-types" }
+aionui-knowledge = { path = "crates/aionui-knowledge" }
 aionui-realtime = { path = "crates/aionui-realtime" }
 aionui-runtime = { path = "crates/aionui-runtime" }
 aionui-auth = { path = "crates/aionui-auth" }
@@ -110,7 +112,7 @@ hmac = "0.12"
 uuid = { version = "1", features = ["v7"] }
 
 # HTTP client — use rustls with native roots to align backend trust with the host system.
-reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls-native-roots"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls-native-roots", "stream"], default-features = false }
 
 # Concurrency
 dashmap = "6"

@@ -17,6 +17,7 @@ use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
 use aionui_api_types::SendMessageRequest;
+use aionui_knowledge::augment_model_prompt;
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
@@ -354,8 +355,12 @@ impl ConversationTurnOrchestrator {
         let runtime_state = self.service.runtime_state();
         let allowed_skill_names = input.build_options.context.skills.clone();
         let first_turn_msg_id = ConversationService::mint_msg_id();
+        let content = input.request.retrieval.as_ref().map_or_else(
+            || input.request.content.clone(),
+            |bundle| augment_model_prompt(bundle, &input.request.content),
+        );
         let initial_send = SendMessageData {
-            content: input.request.content,
+            content,
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
             files: input.request.files,

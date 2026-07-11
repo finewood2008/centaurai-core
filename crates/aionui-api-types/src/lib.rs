@@ -17,6 +17,7 @@ mod cron;
 mod custom_agent;
 mod extension;
 mod file;
+mod knowledge;
 mod lifecycle;
 mod mcp;
 mod model_route;
@@ -111,6 +112,13 @@ pub use file::{
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipFileEntry,
     ZipRequest,
+};
+pub use knowledge::{
+    CreateKnowledgeSourceResponse, CreateKnowledgeSpaceRequest, DeleteKnowledgeSourceResponse, KnowledgeCloudUse,
+    KnowledgeHit, KnowledgeJobResponse, KnowledgeJobStatus, KnowledgeLocator, KnowledgeSearchMode,
+    KnowledgeSearchRequest, KnowledgeSourceResponse, KnowledgeSourceStatus, KnowledgeSpaceResponse,
+    KnowledgeStatusResponse, KnowledgeWorkerState, RetrievalBundle, SendMessageKnowledge, SendMessageKnowledgeMode,
+    UpdateKnowledgeSpaceRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
