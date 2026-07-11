@@ -9,19 +9,22 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
+use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME, LEGACY_CSRF_COOKIE_NAME};
 
 use crate::cookie::CookieConfig;
-use crate::extract::extract_cookie_value;
+use crate::extract::{extract_bearer_token, extract_cookie_value, extract_csrf_cookie, extract_session_token};
 
 /// CSRF protection middleware using the Double Submit Cookie pattern.
 ///
 /// Behavior:
 /// - Safe methods (GET, HEAD, OPTIONS) bypass validation.
 /// - Exempt paths (`/login`, `/api/auth/qr-login`) bypass validation.
-/// - All other requests must include an `x-csrf-token` header whose value
-///   matches the `aionui-csrf-token` cookie.
-/// - Sets the CSRF cookie on responses if the client does not have one.
+/// - State-changing requests authenticated by a session cookie must include
+///   an `x-csrf-token` header matching the canonical (or legacy fallback)
+///   CSRF cookie.
+/// - Authorization Bearer clients bypass CSRF and remain subject to the auth
+///   middleware on protected routes.
+/// - Sets canonical and transition-only legacy CSRF cookies on responses.
 pub async fn csrf_middleware(
     State(cookie_config): State<Arc<CookieConfig>>,
     request: Request,
@@ -30,14 +33,21 @@ pub async fn csrf_middleware(
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
 
-    // Extract CSRF cookie before consuming the request
-    let csrf_cookie = extract_cookie_value(request.headers(), CSRF_COOKIE_NAME);
+    let bearer_token = extract_bearer_token(request.headers());
+    let session_cookie = extract_session_token(request.headers());
+    let primary_csrf_cookie = extract_cookie_value(request.headers(), CSRF_COOKIE_NAME);
+    let legacy_csrf_cookie = extract_cookie_value(request.headers(), LEGACY_CSRF_COOKIE_NAME);
+    let csrf_cookie = extract_csrf_cookie(request.headers());
 
     // Validate CSRF for state-changing requests
     let needs_validation = matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
-    let is_exempt = path == "/login" || path == "/api/auth/qr-login";
+    let is_exempt = path == "/login"
+        || path == "/api/auth/qr-login"
+        || path == "/api/auth/refresh"
+        || path == "/api/devices/pairing/redeem";
+    let uses_cookie_auth = session_cookie.is_some() && bearer_token.is_none();
 
-    if needs_validation && !is_exempt {
+    if needs_validation && !is_exempt && uses_cookie_auth {
         let header_token = request
             .headers()
             .get(CSRF_HEADER_NAME)
@@ -56,11 +66,17 @@ pub async fn csrf_middleware(
 
     let mut response = next.run(request).await;
 
-    // Set CSRF cookie if the client doesn't have one
-    if csrf_cookie.is_none() {
-        let token = generate_csrf_token();
-        let cookie_str = cookie_config.build_csrf_cookie(&token);
-        if let Ok(value) = HeaderValue::from_str(&cookie_str) {
+    if path != "/logout" {
+        let token = csrf_cookie.unwrap_or_else(generate_csrf_token);
+        let cookies = cookie_config.build_csrf_cookies(&token);
+        if primary_csrf_cookie.is_none()
+            && let Ok(value) = HeaderValue::from_str(&cookies[0])
+        {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+        if legacy_csrf_cookie.is_none()
+            && let Ok(value) = HeaderValue::from_str(&cookies[1])
+        {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
     }

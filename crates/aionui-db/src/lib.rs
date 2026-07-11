@@ -20,9 +20,9 @@ pub use error::DbError;
 pub use models::{
     AgentMetadataRow, AgentRunRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow,
     AssistantPreferenceRow, AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
-    ConversationModelAssignmentRow, CreateAssistantParams, ModelRouteMemberRow, ModelRouteRow, SkillImportRecordRow,
-    SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    ConversationModelAssignmentRow, CreateAssistantParams, DevicePairingSessionRow, DeviceRow, ModelRouteMemberRow,
+    ModelRouteRow, SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;
@@ -31,6 +31,7 @@ pub use repository::conversation::{
     MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 pub use repository::cron::UpdateCronJobParams;
+pub use repository::device::{CreateDevicePairingParams, RedeemDevicePairingParams};
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
@@ -43,13 +44,13 @@ pub use repository::{
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository, IAgentMetadataRepository,
     IAgentRunRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository, IClientPreferenceRepository,
-    IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository, IMcpServerRepository,
+    IConversationRepository, ICronRepository, IDeviceRepository, IFeedbackDiagnosticsRepository, IMcpServerRepository,
     IModelRouteRepository, IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository,
     ISkillRepository, ITeamRepository, IUserRepository, PersistedSessionState, RecordModelRouteMetricParams,
     SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAgentRunRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteChannelRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository, SqliteDeviceRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteModelRouteRepository,
     SqliteOAuthTokenRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
     SqliteSkillRepository, SqliteTeamRepository, SqliteUserRepository, UpdateModelRouteParams,

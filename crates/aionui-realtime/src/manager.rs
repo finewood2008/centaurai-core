@@ -72,6 +72,30 @@ impl WebSocketManager {
         }
     }
 
+    /// Close and remove every connection whose bearer token matches a
+    /// caller-supplied revocation predicate. The predicate runs in-process;
+    /// token values are never logged or returned.
+    pub fn disconnect_matching_tokens(&self, matches: impl Fn(&str) -> bool) -> usize {
+        let connection_ids: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|entry| matches(&entry.value().token))
+            .map(|entry| *entry.key())
+            .collect();
+
+        for connection_id in &connection_ids {
+            if let Some(client) = self.connections.get(connection_id) {
+                let _ = client.tx.try_send(terminal_realtime_error(
+                    *connection_id,
+                    RealtimeError::AuthExpired,
+                    "credential revoked",
+                ));
+            }
+            self.remove_client(*connection_id);
+        }
+        connection_ids.len()
+    }
+
     /// Update the last heartbeat timestamp for a connection.
     pub fn update_last_ping(&self, conn_id: ConnectionId) {
         if let Some(mut client) = self.connections.get_mut(&conn_id) {
@@ -362,6 +386,27 @@ mod tests {
         let mgr = WebSocketManager::new();
         mgr.remove_client(ConnectionId(999));
         assert_eq!(mgr.client_count(), 0);
+    }
+
+    #[test]
+    fn disconnect_matching_tokens_closes_only_revoked_credentials() {
+        let mgr = WebSocketManager::new();
+        let (revoked_tx, mut revoked_rx) = new_client_tx();
+        let (active_tx, mut active_rx) = new_client_tx();
+        mgr.add_client("device-revoked".into(), revoked_tx);
+        mgr.add_client("device-active".into(), active_tx);
+
+        let disconnected = mgr.disconnect_matching_tokens(|token| token == "device-revoked");
+
+        assert_eq!(disconnected, 1);
+        assert_eq!(mgr.client_count(), 1);
+        let outbound = revoked_rx.try_recv().unwrap();
+        let WsOutbound::TextThenClose(text, WebSocketCloseCode::PolicyViolation, reason) = outbound else {
+            panic!("expected terminal authentication close");
+        };
+        assert_realtime_auth_expired(&text);
+        assert_eq!(reason, "credential revoked");
+        assert!(active_rx.try_recv().is_err());
     }
 
     #[test]

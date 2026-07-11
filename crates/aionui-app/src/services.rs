@@ -8,7 +8,7 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     WorkerTaskManagerImpl, build_agent_factory,
 };
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
+use aionui_auth::{CookieConfig, DeviceService, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{
     AgentRunScheduler, ConversationModelRouteResolver, ConversationService,
@@ -18,8 +18,9 @@ use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IAgentRunRepository, IConversationRepository,
     IMcpServerRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAgentRunRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository,
-    SqliteModelRouteRepository, SqliteProviderRepository, SqliteSkillRepository, SqliteUserRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteDeviceRepository,
+    SqliteMcpServerRepository, SqliteModelRouteRepository, SqliteProviderRepository, SqliteSkillRepository,
+    SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_system::ModelRouteService;
@@ -32,6 +33,7 @@ pub struct AppServices {
     pub user_repo: Arc<dyn IUserRepository>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
+    pub device_service: Arc<DeviceService>,
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
@@ -105,6 +107,9 @@ impl AppServices {
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
+        let device_service = Arc::new(DeviceService::new(Arc::new(SqliteDeviceRepository::new(
+            database.pool().clone(),
+        ))));
 
         // Resolve JWT secret: env var → system user db field → random generation
         let env_secret = std::env::var("JWT_SECRET").ok();
@@ -245,6 +250,7 @@ impl AppServices {
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
+            device_service,
             ws_manager: Arc::new(WebSocketManager::new()),
             event_bus,
             worker_task_manager,

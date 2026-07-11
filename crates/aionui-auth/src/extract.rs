@@ -1,6 +1,6 @@
 use axum::http::{HeaderMap, Request, header};
 
-use aionui_common::constants::COOKIE_NAME;
+use aionui_common::constants::{COOKIE_NAME, CSRF_COOKIE_NAME, LEGACY_COOKIE_NAME, LEGACY_CSRF_COOKIE_NAME};
 
 /// Extract the client IP address from request headers.
 ///
@@ -34,12 +34,12 @@ pub fn extract_client_ip_from_headers(headers: &HeaderMap) -> String {
 
 /// Extract bearer token from HTTP request headers.
 ///
-/// Priority: `Authorization: Bearer <token>` > `aionui-session` cookie.
+/// Priority: `Authorization: Bearer <token>` > canonical cookie > legacy cookie.
 pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
     if let Some(token) = extract_bearer_token(headers) {
         return Some(token);
     }
-    extract_cookie_value(headers, COOKIE_NAME)
+    extract_session_token(headers)
 }
 
 /// Extract bearer token from WebSocket upgrade request headers.
@@ -50,7 +50,7 @@ pub fn extract_token_from_ws_headers(headers: &HeaderMap) -> Option<String> {
         return Some(token);
     }
 
-    if let Some(token) = extract_cookie_value(headers, COOKIE_NAME) {
+    if let Some(token) = extract_session_token(headers) {
         return Some(token);
     }
 
@@ -62,6 +62,17 @@ pub fn extract_token_from_ws_headers(headers: &HeaderMap) -> Option<String> {
             let first = protocols.split(',').next()?.trim();
             if first.is_empty() { None } else { Some(first.to_owned()) }
         })
+}
+
+/// Extract a session token, preferring the canonical cookie over the legacy
+/// compatibility cookie.
+pub fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+    extract_cookie_value(headers, COOKIE_NAME).or_else(|| extract_cookie_value(headers, LEGACY_COOKIE_NAME))
+}
+
+/// Extract a CSRF token cookie with the same canonical-first rule.
+pub fn extract_csrf_cookie(headers: &HeaderMap) -> Option<String> {
+    extract_cookie_value(headers, CSRF_COOKIE_NAME).or_else(|| extract_cookie_value(headers, LEGACY_CSRF_COOKIE_NAME))
 }
 
 /// Extract a named cookie value from the `Cookie` header.
@@ -82,7 +93,7 @@ pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Extract the bearer token from the `Authorization` header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     if token.is_empty() { None } else { Some(token.to_owned()) }
@@ -140,7 +151,7 @@ mod tests {
 
     #[test]
     fn token_from_cookie() {
-        let headers = headers_with(&[("cookie", "aionui-session=cookie_token; other=val")]);
+        let headers = headers_with(&[("cookie", "centaurai-session=cookie_token; other=val")]);
         assert_eq!(extract_token_from_headers(&headers), Some("cookie_token".into()));
     }
 
@@ -148,7 +159,7 @@ mod tests {
     fn token_header_takes_priority_over_cookie() {
         let headers = headers_with(&[
             ("authorization", "Bearer header_token"),
-            ("cookie", "aionui-session=cookie_token"),
+            ("cookie", "centaurai-session=cookie_token"),
         ]);
         assert_eq!(extract_token_from_headers(&headers), Some("header_token".into()));
     }
@@ -181,7 +192,7 @@ mod tests {
 
     #[test]
     fn ws_token_from_cookie() {
-        let headers = headers_with(&[("cookie", "aionui-session=ws_cookie")]);
+        let headers = headers_with(&[("cookie", "centaurai-session=ws_cookie")]);
         assert_eq!(extract_token_from_ws_headers(&headers), Some("ws_cookie".into()));
     }
 
@@ -195,7 +206,7 @@ mod tests {
     fn ws_token_priority_order() {
         let headers = headers_with(&[
             ("authorization", "Bearer auth_token"),
-            ("cookie", "aionui-session=cookie_token"),
+            ("cookie", "centaurai-session=cookie_token"),
             ("sec-websocket-protocol", "proto_token"),
         ]);
         assert_eq!(extract_token_from_ws_headers(&headers), Some("auth_token".into()));
@@ -205,7 +216,7 @@ mod tests {
     fn ws_token_fallback_through_sources() {
         // Only cookie and protocol, no authorization
         let headers = headers_with(&[
-            ("cookie", "aionui-session=cookie_token"),
+            ("cookie", "centaurai-session=cookie_token"),
             ("sec-websocket-protocol", "proto_token"),
         ]);
         assert_eq!(extract_token_from_ws_headers(&headers), Some("cookie_token".into()));
@@ -257,5 +268,29 @@ mod tests {
         // session cookie even when other entries lack '='
         let headers = headers_with(&[("cookie", "garbage; aionui-session=abc; nope")]);
         assert_eq!(extract_token_from_headers(&headers), Some("abc".into()));
+    }
+
+    #[test]
+    fn legacy_session_cookie_remains_readable() {
+        let headers = headers_with(&[("cookie", "aionui-session=legacy_token")]);
+        assert_eq!(extract_session_token(&headers), Some("legacy_token".into()));
+    }
+
+    #[test]
+    fn canonical_session_cookie_wins_over_legacy_cookie() {
+        let headers = headers_with(&[(
+            "cookie",
+            "aionui-session=legacy_token; centaurai-session=canonical_token",
+        )]);
+        assert_eq!(extract_session_token(&headers), Some("canonical_token".into()));
+    }
+
+    #[test]
+    fn csrf_cookie_reads_both_namespaces_with_canonical_priority() {
+        let legacy = headers_with(&[("cookie", "aionui-csrf-token=legacy")]);
+        assert_eq!(extract_csrf_cookie(&legacy), Some("legacy".into()));
+
+        let both = headers_with(&[("cookie", "aionui-csrf-token=legacy; centaurai-csrf-token=canonical")]);
+        assert_eq!(extract_csrf_cookie(&both), Some("canonical".into()));
     }
 }

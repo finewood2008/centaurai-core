@@ -140,12 +140,22 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         user_repo: services.user_repo.clone(),
         cookie_config: services.cookie_config.clone(),
         qr_token_store: services.qr_token_store.clone(),
+        device_service: services.device_service.clone(),
+        on_device_revoked: Arc::new({
+            let ws_manager = services.ws_manager.clone();
+            move |revoked_hash: &str| {
+                ws_manager.disconnect_matching_tokens(|token| {
+                    aionui_auth::device_credential_matches_hash(token, revoked_hash)
+                });
+            }
+        }),
         local: services.local,
     };
 
     let auth_mw_state = AuthState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
+        device_service: services.device_service.clone(),
         local: services.local,
         proxy_identity: aionui_auth::ProxyIdentityVerifier::from_env(),
     };

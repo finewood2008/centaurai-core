@@ -13,9 +13,11 @@ pub const WS_CLOSE_POLICY_VIOLATION: u16 = 1008;
 // --- Authentication ---
 
 pub const SESSION_EXPIRY: &str = "24h";
-pub const COOKIE_NAME: &str = "aionui-session";
+pub const COOKIE_NAME: &str = "centaurai-session";
+pub const LEGACY_COOKIE_NAME: &str = "aionui-session";
 pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
-pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
+pub const CSRF_COOKIE_NAME: &str = "centaurai-csrf-token";
+pub const LEGACY_CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 
 // --- Server ---
@@ -57,6 +59,13 @@ pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> boo
         .is_some()
 }
 
+// --- Image processing ---
+
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
+/// Remote image download size limit (5 MB).
+pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
+pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,10 +94,3 @@ mod tests {
         }))));
     }
 }
-
-// --- Image processing ---
-
-pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
-/// Remote image download size limit (5 MB).
-pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
-pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;

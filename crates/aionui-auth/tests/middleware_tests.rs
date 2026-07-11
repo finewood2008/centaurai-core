@@ -10,11 +10,11 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthState, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload, api_rate_limit_middleware,
-    auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware, csrf_middleware,
-    security_headers_middleware,
+    AuthState, CookieConfig, CurrentUser, DeviceService, JwtService, RateLimiter, TokenPayload,
+    api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
+    csrf_middleware, security_headers_middleware,
 };
-use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+use aionui_db::{IUserRepository, SqliteDeviceRepository, SqliteUserRepository, init_database_memory};
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -59,6 +59,7 @@ fn csrf_app() -> Router {
         .route("/api/test", post(|| async { "ok" }))
         .route("/login", post(|| async { "logged in" }))
         .route("/api/auth/qr-login", post(|| async { "qr ok" }))
+        .route("/api/devices/pairing/redeem", post(|| async { "redeemed" }))
         .route("/get-test", get(|| async { "get ok" }))
         .layer(middleware::from_fn_with_state(config, csrf_middleware))
 }
@@ -77,7 +78,12 @@ async fn t12_2_get_requests_bypass_csrf() {
 async fn t12_2_post_without_csrf_token_rejected() {
     let app = csrf_app();
     let resp = app
-        .oneshot(Request::post("/api/test").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::post("/api/test")
+                .header("cookie", "centaurai-session=session")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -92,7 +98,10 @@ async fn t12_2_post_with_matching_csrf_tokens_accepted() {
     let resp = app
         .oneshot(
             Request::post("/api/test")
-                .header("cookie", format!("aionui-csrf-token={token}"))
+                .header(
+                    "cookie",
+                    format!("centaurai-session=session; centaurai-csrf-token={token}"),
+                )
                 .header("x-csrf-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -103,12 +112,49 @@ async fn t12_2_post_with_matching_csrf_tokens_accepted() {
 }
 
 #[tokio::test]
+async fn t12_2_legacy_cookie_pair_remains_accepted_during_transition() {
+    let app = csrf_app();
+    let token = "legacy-csrf-token";
+    let response = app
+        .oneshot(
+            Request::post("/api/test")
+                .header("cookie", format!("aionui-session=session; aionui-csrf-token={token}"))
+                .header("x-csrf-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn t12_2_conflicting_legacy_csrf_cannot_override_canonical_cookie() {
+    let app = csrf_app();
+    let response = app
+        .oneshot(
+            Request::post("/api/test")
+                .header(
+                    "cookie",
+                    "centaurai-session=session; centaurai-csrf-token=primary; aionui-csrf-token=legacy",
+                )
+                .header("x-csrf-token", "legacy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(response).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
 async fn t12_2_post_with_mismatched_csrf_tokens_rejected() {
     let app = csrf_app();
     let resp = app
         .oneshot(
             Request::post("/api/test")
-                .header("cookie", "aionui-csrf-token=token_a")
+                .header("cookie", "centaurai-session=session; centaurai-csrf-token=token_a")
                 .header("x-csrf-token", "token_b")
                 .body(Body::empty())
                 .unwrap(),
@@ -127,13 +173,21 @@ async fn t12_2_post_with_mismatched_csrf_tokens_rejected() {
 async fn auth_app(jwt_service: Arc<JwtService>) -> Router {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
-    protected_auth_app(jwt_service, user_repo)
+    let device_service = Arc::new(DeviceService::new(Arc::new(SqliteDeviceRepository::new(
+        db.pool().clone(),
+    ))));
+    protected_auth_app(jwt_service, user_repo, device_service)
 }
 
-fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepository>) -> Router {
+fn protected_auth_app(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    device_service: Arc<DeviceService>,
+) -> Router {
     let state = AuthState {
         jwt_service,
         user_repo,
+        device_service,
         local: false,
         proxy_identity: None,
     };
@@ -246,8 +300,11 @@ async fn auth_middleware_database_error_returns_internal_error_code() {
     let token = jwt_service.sign("system_default_user", "system_default_user").unwrap();
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let device_service = Arc::new(DeviceService::new(Arc::new(SqliteDeviceRepository::new(
+        db.pool().clone(),
+    ))));
     db.close().await;
-    let app = protected_auth_app(jwt_service, user_repo);
+    let app = protected_auth_app(jwt_service, user_repo, device_service);
 
     let resp = app
         .oneshot(
@@ -291,6 +348,81 @@ async fn t12_2_qr_login_exempt_from_csrf() {
 }
 
 #[tokio::test]
+async fn t12_2_anonymous_state_change_is_left_for_route_auth() {
+    let app = csrf_app();
+    let resp = app
+        .oneshot(Request::post("/api/test").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn t12_2_bearer_request_bypasses_csrf_even_cross_origin() {
+    let app = csrf_app();
+    let resp = app
+        .oneshot(
+            Request::post("/api/test")
+                .header("authorization", "Bearer native-client-token")
+                .header("origin", "https://attacker.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn t12_2_cross_origin_cookie_request_without_double_submit_is_rejected() {
+    let app = csrf_app();
+    let resp = app
+        .oneshot(
+            Request::post("/api/test")
+                .header("cookie", "centaurai-session=session; centaurai-csrf-token=secret")
+                .header("origin", "https://attacker.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn t12_2_forged_header_without_cookie_does_not_satisfy_cookie_csrf() {
+    let app = csrf_app();
+    let resp = app
+        .oneshot(
+            Request::post("/api/test")
+                .header("cookie", "centaurai-session=session")
+                .header("x-csrf-token", "forged")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn t12_2_anonymous_pairing_redeem_is_csrf_exempt_even_with_stale_cookie() {
+    let app = csrf_app();
+    let resp = app
+        .oneshot(
+            Request::post("/api/devices/pairing/redeem")
+                .header("cookie", "centaurai-session=stale")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn t12_2_csrf_cookie_set_on_first_request() {
     let app = csrf_app();
     let resp = app
@@ -298,10 +430,23 @@ async fn t12_2_csrf_cookie_set_on_first_request() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie.contains("aionui-csrf-token="));
-    // NOT HttpOnly (JS must read it)
-    assert!(!set_cookie.contains("HttpOnly"));
+    let set_cookies: Vec<_> = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("centaurai-csrf-token="))
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("aionui-csrf-token="))
+    );
+    assert!(set_cookies.iter().all(|cookie| !cookie.contains("HttpOnly")));
 }
 
 // ============================================================

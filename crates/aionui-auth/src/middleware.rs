@@ -11,6 +11,7 @@ use aionui_db::IUserRepository;
 
 use crate::JwtService;
 use crate::ProxyIdentityVerifier;
+use crate::device::DeviceService;
 use crate::extract::extract_token_from_headers;
 
 /// Authenticated user injected into request extensions by the auth middleware.
@@ -32,6 +33,7 @@ pub struct CurrentUser {
 pub struct AuthState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub device_service: Arc<DeviceService>,
     /// When `true`, skip JWT verification and inject a fixed default user.
     pub local: bool,
     /// Optional per-process verifier used by the trusted WebHost reverse proxy.
@@ -41,8 +43,8 @@ pub struct AuthState {
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
 ///
 /// Flow:
-/// 1. Extract bearer token from `Authorization` header or `aionui-session` cookie
-/// 2. Verify JWT signature, expiration, and blacklist
+/// 1. Extract bearer token from `Authorization` or canonical/legacy cookies
+/// 2. Verify either a JWT or a persisted, non-revoked device credential
 /// 3. Look up user in the database to ensure they still exist
 /// 4. Insert [`CurrentUser`] into request extensions
 ///
@@ -92,14 +94,31 @@ pub async fn auth_middleware(
     let token = extract_token_from_headers(request.headers())
         .ok_or_else(|| ApiError::Unauthorized("Authentication required".into()))?;
 
-    let payload = state.jwt_service.verify(&token).map_err(|e| {
-        tracing::debug!("Token verification failed: {e}");
-        ApiError::Unauthorized("Invalid or expired token".into())
-    })?;
+    let user_id = if DeviceService::is_device_token(&token) {
+        state
+            .device_service
+            .authenticate_token(&token)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "device authentication lookup failed");
+                ApiError::Internal("Authentication service unavailable".into())
+            })?
+            .map(|principal| principal.user_id)
+            .ok_or_else(|| ApiError::Unauthorized("Invalid or expired token".into()))?
+    } else {
+        state
+            .jwt_service
+            .verify(&token)
+            .map_err(|e| {
+                tracing::debug!("Token verification failed: {e}");
+                ApiError::Unauthorized("Invalid or expired token".into())
+            })?
+            .user_id
+    };
 
     let user = state
         .user_repo
-        .find_by_id(&payload.user_id)
+        .find_by_id(&user_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "auth middleware user lookup failed");
@@ -110,7 +129,7 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username,
-        is_admin: payload.user_id == "system_default_user",
+        is_admin: user_id == "system_default_user",
     });
 
     Ok(next.run(request).await)

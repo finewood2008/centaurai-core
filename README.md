@@ -45,6 +45,21 @@ Trusted proxy identity headers use `x-centaurai-proxy-user-id`,
 legacy `x-aionui-proxy-*` family remains accepted. A partial canonical family
 fails closed instead of falling back to legacy values.
 
+Browser authentication uses `centaurai-session` and
+`centaurai-csrf-token`. During the migration window the legacy
+`aionui-session` and `aionui-csrf-token` cookies are also read, written, and
+cleared; canonical values take priority when both are present. CSRF validation
+applies only when authentication is carried by a session cookie. Native
+clients using `Authorization: Bearer ...` still require valid authentication
+but do not send a CSRF token.
+
+Context clients pair through `POST /api/devices/pairing` and redeem the
+five-minute, one-time code at `POST /api/devices/pairing/redeem`. Pairing URLs
+accept only private LAN, mDNS, or Tailscale HTTP(S) server addresses. Device
+tokens use the `cai_dev_v1_` prefix, are returned only by the successful redeem
+response, and are persisted only as SHA-256 hashes. Revocation immediately
+invalidates REST and WebSocket authentication for that credential.
+
 Provider credentials are write-only in create/update requests. Provider
 responses return `api_key_mask`, `key_id`, and `api_key_present`; the legacy
 `api_key` response field is retained only as a masked compatibility alias.

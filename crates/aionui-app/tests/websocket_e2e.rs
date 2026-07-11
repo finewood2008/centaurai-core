@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{CreateDevicePairingRequest, RedeemDevicePairingRequest, WebSocketMessage};
 use aionui_app::{AppConfig, AppServices, create_router};
 use aionui_realtime::WebSocketManager;
 use futures_util::{SinkExt, StreamExt};
@@ -238,6 +238,61 @@ async fn t1_1_valid_bearer_token_connects() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(ws_manager(&app).client_count(), 1);
+}
+
+#[tokio::test]
+async fn device_revocation_closes_existing_websocket_and_rejects_reconnect() {
+    let app = start_app().await;
+    let pairing = app
+        .services
+        .device_service
+        .create_pairing(
+            "user1",
+            CreateDevicePairingRequest {
+                server_url: format!("http://{}", app.addr),
+            },
+        )
+        .await
+        .unwrap();
+    let code = pairing.pairing_uri.rsplit("code=").next().unwrap().to_owned();
+    let credential = app
+        .services
+        .device_service
+        .redeem_pairing(RedeemDevicePairingRequest {
+            code,
+            name: "Test Phone".into(),
+            platform: "ios".into(),
+        })
+        .await
+        .unwrap();
+
+    let (_tx, mut rx) = connect_bearer(app.addr, &credential.device_token).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(ws_manager(&app).client_count(), 1);
+
+    let owner_token = sign_token(&app, "user1");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/devices/{}/revoke",
+            app.addr, credential.device.id
+        ))
+        .bearer_auth(owner_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let error = read_text(&mut rx).await;
+    assert_realtime_error(&error, "REALTIME_AUTH_EXPIRED", false);
+    assert_eq!(read_close(&mut rx).await, Some(1008));
+    assert_eq!(ws_manager(&app).client_count(), 0);
+
+    let (_tx, mut rejected) = connect_bearer(app.addr, &credential.device_token).await;
+    let error = read_text(&mut rejected).await;
+    assert_realtime_error(&error, "REALTIME_AUTH_EXPIRED", false);
+    assert_eq!(read_close(&mut rejected).await, Some(1008));
+    assert_eq!(ws_manager(&app).client_count(), 0);
 }
 
 #[tokio::test]

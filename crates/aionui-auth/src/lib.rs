@@ -3,6 +3,7 @@
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
 mod cookie;
 mod csrf;
+mod device;
 mod error;
 mod extract;
 mod jwt;
@@ -16,6 +17,10 @@ mod security;
 mod validation;
 
 // Error type
+pub use device::{
+    DEVICE_TOKEN_PREFIX, DeviceError, DevicePrincipal, DeviceService, RevokedDevice, device_credential_matches_hash,
+    hash_device_credential,
+};
 pub use error::AuthError;
 
 // JWT service
@@ -38,8 +43,8 @@ pub use rate_limit::{
 
 // Token / IP extraction
 pub use extract::{
-    extract_client_ip, extract_client_ip_from_headers, extract_cookie_value, extract_token_from_headers,
-    extract_token_from_ws_headers,
+    extract_bearer_token, extract_client_ip, extract_client_ip_from_headers, extract_cookie_value, extract_csrf_cookie,
+    extract_session_token, extract_token_from_headers, extract_token_from_ws_headers,
 };
 
 // Cookie configuration
