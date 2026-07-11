@@ -10,8 +10,9 @@ use aionui_api_types::{
 use aionui_common::ApiError;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, IF_RANGE, RANGE};
 use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -49,6 +50,7 @@ pub fn knowledge_routes(state: KnowledgeRouterState) -> Router {
         .route("/api/knowledge/spaces", get(list_spaces).post(create_space))
         .route("/api/knowledge/spaces/{id}", patch(update_space))
         .route("/api/knowledge/sources", get(list_sources))
+        .route("/api/knowledge/sources/{id}/content", get(source_content))
         .route("/api/knowledge/sources/{id}", delete(delete_source))
         .route("/api/knowledge/jobs/{id}", get(job))
         .route("/api/knowledge/search", post(search))
@@ -137,6 +139,12 @@ struct SourceListQuery {
     offset: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceContentQuery {
+    download: Option<bool>,
+}
+
 fn default_source_limit() -> u32 {
     100
 }
@@ -178,6 +186,38 @@ async fn delete_source(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<DeleteKnowledgeSourceResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(state.gateway.delete_source(&id).await?)))
+}
+
+async fn source_content(
+    State(state): State<KnowledgeRouterState>,
+    Path(id): Path<String>,
+    Query(query): Query<SourceContentQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if headers.get_all(RANGE).iter().count() > 1 || headers.get_all(IF_RANGE).iter().count() > 1 {
+        return Err(KnowledgeError::InvalidRequest.into());
+    }
+    let content = state
+        .gateway
+        .source_content(
+            &id,
+            query.download,
+            method,
+            headers.get(RANGE).cloned(),
+            headers.get(IF_RANGE).cloned(),
+        )
+        .await?;
+    let mut response = Response::new(content.body);
+    *response.status_mut() = content.status;
+    *response.headers_mut() = content.headers;
+    response.headers_mut().insert(
+        CONTENT_SECURITY_POLICY,
+        "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'"
+            .parse()
+            .expect("static knowledge content policy is valid"),
+    );
+    Ok(response)
 }
 
 async fn job(

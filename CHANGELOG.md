@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.1](https://github.com/finewood2008/centaurai-core/compare/v0.2.0...v0.2.1) (2026-07-12)
+
+### Features
+
+- Added an authenticated, range-aware streaming source-content route through
+  the Core-owned Knowledge Gateway.
+
+### Security
+
+- Source downloads forward only explicitly allowed request and response
+  headers, sanitize Worker failures, and never buffer complete documents.
+- Knowledge citation locators now use a Core-owned `contextofme://` URI after
+  strict page, chapter, and timestamp validation.
+
 ## [0.2.0](https://github.com/finewood2008/centaurai-core/compare/v0.1.48...v0.2.0) (2026-07-12)
 
 ### Features

@@ -76,6 +76,7 @@ aionui-ai-agent = { workspace = true, features = ["test-support"] }
 base64.workspace = true
 git2.workspace = true
 http-body-util.workspace = true
+jsonwebtoken.workspace = true
 rust_xlsxwriter.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
 tempfile = "3"

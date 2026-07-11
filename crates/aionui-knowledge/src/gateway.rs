@@ -9,6 +9,7 @@ use aionui_api_types::{
 };
 use async_trait::async_trait;
 use axum::body::Body;
+use axum::http::{HeaderMap, Method as HttpMethod, StatusCode};
 use reqwest::Method;
 use reqwest::header::HeaderValue;
 use serde_json::Value;
@@ -21,6 +22,7 @@ const MAX_HITS: u32 = 50;
 const MAX_SNIPPET_CHARS: usize = 4_000;
 const MAX_TITLE_CHARS: usize = 500;
 const MAX_SPACE_ID_CHARS: usize = 128;
+const MAX_CHAPTER_CHARS: usize = 200;
 const MAX_MODEL_CONTEXT_TOKENS: u32 = 8_000;
 const APPROXIMATE_CHARS_PER_TOKEN: usize = 4;
 
@@ -50,6 +52,12 @@ impl ModelLocationResolver for UnknownModelLocationResolver {
 pub struct KnowledgeGateway {
     worker: Option<WorkerClient>,
     model_location: Arc<dyn ModelLocationResolver>,
+}
+
+pub(crate) struct KnowledgeSourceContent {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Body,
 }
 
 impl std::fmt::Debug for KnowledgeGateway {
@@ -225,6 +233,35 @@ impl KnowledgeGateway {
         }
     }
 
+    pub(crate) async fn source_content(
+        &self,
+        source_id: &str,
+        download: Option<bool>,
+        method: HttpMethod,
+        range: Option<HeaderValue>,
+        if_range: Option<HeaderValue>,
+    ) -> Result<KnowledgeSourceContent, KnowledgeError> {
+        if !valid_source_content_id(source_id) {
+            return Err(KnowledgeError::InvalidRequest);
+        }
+        if !matches!(method, HttpMethod::GET | HttpMethod::HEAD)
+            || (if_range.is_some() && range.is_none())
+            || range.as_ref().is_some_and(|value| !valid_range(value))
+            || if_range.as_ref().is_some_and(|value| !valid_if_range(value))
+        {
+            return Err(KnowledgeError::InvalidRequest);
+        }
+        let response = self
+            .worker()?
+            .source_content(source_id, download, method, range, if_range)
+            .await?;
+        Ok(KnowledgeSourceContent {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+
     pub async fn job(&self, job_id: &str) -> Result<KnowledgeJobResponse, KnowledgeError> {
         validate_id(job_id)?;
         let job = self
@@ -319,7 +356,7 @@ impl KnowledgeGateway {
             .worker()?
             .send(Method::POST, "/api/knowledge/search", None, &request)
             .await?;
-        validate_bundle(&bundle, &request)?;
+        normalize_bundle(&mut bundle, &request)?;
         enforce_model_context_budget(&mut bundle.hits);
         bundle.token_budget = estimate_token_budget(&bundle.hits);
         bundle.cloud_authorized = request.cloud_use;
@@ -435,12 +472,15 @@ fn normalize_search(request: &mut KnowledgeSearchRequest) -> Result<(), Knowledg
     Ok(())
 }
 
-fn validate_bundle(bundle: &RetrievalBundle, request: &KnowledgeSearchRequest) -> Result<(), KnowledgeError> {
+fn normalize_bundle(bundle: &mut RetrievalBundle, request: &KnowledgeSearchRequest) -> Result<(), KnowledgeError> {
     if bundle.query != request.query
         || bundle.hits.len() > request.max_hits as usize
         || bundle.hits.iter().any(|hit| !validate_hit(hit))
     {
         return Err(KnowledgeError::InvalidResponse);
+    }
+    for hit in &mut bundle.hits {
+        hit.locator.uri = Some(format!("contextofme://knowledge/sources/{}", hit.source_id));
     }
     Ok(())
 }
@@ -453,6 +493,11 @@ fn validate_hit(hit: &KnowledgeHit) -> bool {
         && hit.score.is_finite()
         && !hit.media_type.trim().is_empty()
         && hit.locator.page.is_none_or(|page| page > 0)
+        && hit.locator.chapter.as_ref().is_none_or(|chapter| {
+            !chapter.trim().is_empty()
+                && chapter.chars().count() <= MAX_CHAPTER_CHARS
+                && !chapter.chars().any(char::is_control)
+        })
         && hit
             .locator
             .start_seconds
@@ -461,6 +506,49 @@ fn validate_hit(hit: &KnowledgeHit) -> bool {
             .locator
             .end_seconds
             .is_none_or(|seconds| seconds.is_finite() && seconds >= 0.0)
+        && match (hit.locator.start_seconds, hit.locator.end_seconds) {
+            (Some(start), Some(end)) => end >= start,
+            _ => true,
+        }
+}
+
+fn valid_range(value: &HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    if value.len() > 128 || !value.starts_with("bytes=") {
+        return false;
+    }
+    let range = &value[6..];
+    if range.is_empty() || range.contains(',') || range.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    if start.is_empty() {
+        return end.parse::<u64>().is_ok_and(|suffix| suffix > 0);
+    }
+    let Ok(start) = start.parse::<u64>() else {
+        return false;
+    };
+    end.is_empty() || end.parse::<u64>().is_ok_and(|end| end >= start)
+}
+
+fn valid_if_range(value: &HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    if value.is_empty() || value.len() > 256 {
+        return false;
+    }
+    let strong_etag = value.starts_with('"')
+        && value.ends_with('"')
+        && value.len() > 2
+        && !value[1..value.len() - 1]
+            .chars()
+            .any(|character| character == '"' || character.is_control());
+    strong_etag || httpdate::parse_http_date(value).is_ok()
 }
 
 fn estimate_token_budget(hits: &[KnowledgeHit]) -> u32 {
@@ -521,6 +609,13 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_source_content_id(id: &str) -> bool {
+    id.len() == 24
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_subresource_path(path: &str) -> Result<(), KnowledgeError> {
@@ -587,6 +682,25 @@ mod tests {
         };
         assert!(!validate_hit(&hit));
         assert!(validate_subresource_path("/api/knowledge/wiki/../status").is_err());
+    }
+
+    #[test]
+    fn source_content_identifiers_and_conditional_ranges_are_fail_closed() {
+        assert!(valid_source_content_id("0123456789abcdef01234567"));
+        assert!(!valid_source_content_id("0123456789ABCDEF01234567"));
+        assert!(!valid_source_content_id("source_1"));
+
+        for range in ["bytes=0-99", "bytes=100-", "bytes=-100"] {
+            assert!(valid_range(&HeaderValue::from_static(range)), "{range}");
+        }
+        for range in ["bytes=", "items=0-1", "bytes=5-4", "bytes=0-1,3-4"] {
+            assert!(!valid_range(&HeaderValue::from_static(range)), "{range}");
+        }
+        assert!(valid_if_range(&HeaderValue::from_static("\"strong-etag\"")));
+        assert!(valid_if_range(&HeaderValue::from_static(
+            "Sun, 12 Jul 2026 00:00:00 GMT"
+        )));
+        assert!(!valid_if_range(&HeaderValue::from_static("W/\"weak-etag\"")));
     }
 
     #[test]

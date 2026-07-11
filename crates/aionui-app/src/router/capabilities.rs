@@ -89,6 +89,7 @@ fn capabilities() -> CoreCapabilitiesResponse {
             ("logical_model_routes".into(), true),
             ("knowledge_gateway".into(), true),
             ("knowledge_message_retrieval".into(), true),
+            ("knowledge_source_content".into(), true),
             ("knowledge_worker_supervision".into(), true),
             ("mcp".into(), true),
             ("provider_secret_redaction".into(), true),
@@ -129,6 +130,7 @@ mod tests {
         assert_eq!(body["data"]["features"]["decisions"], true);
         assert_eq!(body["data"]["features"]["device_pairing"], true);
         assert_eq!(body["data"]["features"]["knowledge_gateway"], true);
+        assert_eq!(body["data"]["features"]["knowledge_source_content"], true);
         assert_eq!(body["data"]["websocket"]["version"], "1");
         assert!(
             body["data"]["websocket"]["events"]

@@ -76,6 +76,20 @@ preferred transport is the Unix socket configured by
 `CENTAURAI_KNOWLEDGE_WORKER_URL` is an explicit loopback-only fallback and must
 use a literal loopback IP. Client requests cannot override either transport.
 
+Authenticated clients open original source material through
+`GET|HEAD /api/knowledge/sources/{source_id}/content?download=<bool>`, where
+`source_id` is the Worker's 24-character lowercase hexadecimal identifier. Core
+forwards only a valid single `Range` and optional `If-Range` condition, adds
+the private Worker credential itself, and streams the response without
+buffering it. Cookie, authorization, host, forwarding, and other client
+headers never cross the Worker boundary. Only the documented content,
+range, cache-validation, and disposition response headers are returned.
+Worker authentication failures and server errors are sanitized at the public
+boundary, and Core applies a sandboxed content policy so an uploaded HTML or
+SVG document cannot become a same-origin application. Retrieval locator URIs are always rewritten by Core to
+`contextofme://knowledge/sources/{source_id}` after validating page, chapter,
+and media timestamp fields.
+
 An appliance sets `CENTAURAI_CORE_KNOWLEDGE_WORKER_BIN` to an absolute,
 executable Worker path. Core then owns that process: it passes the public Core
 socket setting to the child as `CENTAURAI_KNOWLEDGE_SOCKET`, passes

@@ -37,7 +37,7 @@ fn valid_search_response() -> serde_json::Value {
             "snippet": "The first milestone is a private beta.",
             "score": 0.91,
             "media_type": "pdf",
-            "locator": {"page": 3, "uri": "contextofme://knowledge/sources/source_1"}
+            "locator": {"page": 3, "uri": "file:///etc/passwd"}
         }],
         "token_budget": 0,
         "cloud_authorized": false,
@@ -76,6 +76,10 @@ async fn search_uses_fixed_worker_origin_private_token_and_validates_hits() {
 
     assert_eq!(bundle.hits[0].source_id, "source_1");
     assert_eq!(bundle.hits[0].locator.page, Some(3));
+    assert_eq!(
+        bundle.hits[0].locator.uri.as_deref(),
+        Some("contextofme://knowledge/sources/source_1")
+    );
     assert!(bundle.token_budget > 0);
     assert!(!bundle.cloud_authorized);
 }
@@ -206,4 +210,30 @@ async fn malformed_worker_dto_is_rejected_at_runtime() {
         .await
         .unwrap_err();
     assert!(matches!(error, KnowledgeError::InvalidResponse));
+}
+
+#[tokio::test]
+async fn unsafe_locator_coordinates_are_rejected_before_a_citation_is_returned() {
+    for locator in [
+        serde_json::json!({"page": 0}),
+        serde_json::json!({"chapter": "chapter\nset-cookie: secret"}),
+        serde_json::json!({"chapter": "x".repeat(201)}),
+        serde_json::json!({"start_seconds": -1.0}),
+        serde_json::json!({"start_seconds": 9.0, "end_seconds": 8.0}),
+    ] {
+        let server = MockServer::start().await;
+        let mut response = valid_search_response();
+        response["hits"][0]["locator"] = locator;
+        Mock::given(method("POST"))
+            .and(path("/api/knowledge/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+        let error = gateway(&server, ModelLocation::Local)
+            .await
+            .search(search_request(false))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, KnowledgeError::InvalidResponse));
+    }
 }

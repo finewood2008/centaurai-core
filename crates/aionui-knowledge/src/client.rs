@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use axum::body::Body;
 use futures_util::TryStreamExt;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderName,
+    HeaderValue, IF_RANGE, LAST_MODIFIED, RANGE,
+};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,9 +24,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone)]
 pub(crate) struct WorkerClient {
     client: reqwest::Client,
+    stream_client: reqwest::Client,
     base_url: Url,
     token: String,
     transport_label: &'static str,
+}
+
+pub(crate) struct WorkerContentResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Body,
 }
 
 impl fmt::Debug for WorkerClient {
@@ -67,11 +77,15 @@ impl WorkerClient {
 
     pub(crate) fn for_loopback_url(endpoint: &str, token: String) -> Result<Self, KnowledgeConfigError> {
         let base_url = validate_loopback_endpoint(endpoint)?;
-        let client = client_builder()
+        let client = client_builder(true)
+            .build()
+            .map_err(|_| KnowledgeConfigError::TransportInitialization)?;
+        let stream_client = client_builder(false)
             .build()
             .map_err(|_| KnowledgeConfigError::TransportInitialization)?;
         Ok(Self {
             client,
+            stream_client,
             base_url,
             token,
             transport_label: "loopback",
@@ -83,12 +97,17 @@ impl WorkerClient {
         if !socket.is_absolute() {
             return Err(KnowledgeConfigError::InvalidSocketPath);
         }
-        let client = client_builder()
+        let client = client_builder(true)
+            .unix_socket(socket.clone())
+            .build()
+            .map_err(|_| KnowledgeConfigError::TransportInitialization)?;
+        let stream_client = client_builder(false)
             .unix_socket(socket)
             .build()
             .map_err(|_| KnowledgeConfigError::TransportInitialization)?;
         Ok(Self {
             client,
+            stream_client,
             base_url: Url::parse("http://knowledge-worker/")
                 .map_err(|_| KnowledgeConfigError::TransportInitialization)?,
             token,
@@ -157,6 +176,58 @@ impl WorkerClient {
         decode_response(response).await
     }
 
+    pub(crate) async fn source_content(
+        &self,
+        source_id: &str,
+        download: Option<bool>,
+        method: Method,
+        range: Option<HeaderValue>,
+        if_range: Option<HeaderValue>,
+    ) -> Result<WorkerContentResponse, KnowledgeError> {
+        let return_body = method == Method::GET;
+        let path = format!("/api/knowledge/sources/{source_id}/content");
+        let query = download.map(|download| format!("download={download}"));
+        let url = self.url_for(&path, query.as_deref())?;
+        let mut request = self
+            .stream_client
+            .request(method, url)
+            .header(INTERNAL_TOKEN_HEADER, &self.token);
+        if let Some(range) = range {
+            request = request.header(RANGE, range);
+        }
+        if let Some(if_range) = if_range {
+            request = request.header(IF_RANGE, if_range);
+        }
+
+        let response = request.send().await.map_err(map_transport_error)?;
+        let status = response.status();
+        match status {
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
+                let headers = filtered_content_headers(response.headers());
+                let body = if return_body {
+                    let stream = response
+                        .bytes_stream()
+                        .map_err(|_| std::io::Error::other("knowledge source stream failed"));
+                    Body::from_stream(stream)
+                } else {
+                    Body::empty()
+                };
+                Ok(WorkerContentResponse { status, headers, body })
+            }
+            StatusCode::RANGE_NOT_SATISFIABLE => Ok(WorkerContentResponse {
+                status,
+                headers: filtered_content_headers(response.headers()),
+                body: Body::empty(),
+            }),
+            StatusCode::NOT_FOUND => Err(KnowledgeError::NotFound),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Err(KnowledgeError::InvalidRequest),
+            StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => Err(KnowledgeError::Timeout),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(KnowledgeError::InvalidResponse),
+            status if status.is_server_error() => Err(KnowledgeError::Unavailable),
+            _ => Err(KnowledgeError::InvalidResponse),
+        }
+    }
+
     async fn request_json<TRequest, TResponse>(
         &self,
         method: Method,
@@ -201,12 +272,36 @@ impl WorkerClient {
     }
 }
 
-fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+fn client_builder(with_request_timeout: bool) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT);
+    if with_request_timeout {
+        builder.timeout(REQUEST_TIMEOUT)
+    } else {
+        builder
+    }
+}
+
+const CONTENT_RESPONSE_HEADERS: &[HeaderName] = &[
+    CONTENT_TYPE,
+    CONTENT_LENGTH,
+    CONTENT_RANGE,
+    CONTENT_DISPOSITION,
+    ACCEPT_RANGES,
+    ETAG,
+    LAST_MODIFIED,
+];
+
+fn filtered_content_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut filtered = HeaderMap::new();
+    for name in CONTENT_RESPONSE_HEADERS {
+        if let Some(value) = headers.get(name) {
+            filtered.insert(name.clone(), value.clone());
+        }
+    }
+    filtered
 }
 
 pub(crate) fn validate_loopback_endpoint(endpoint: &str) -> Result<Url, KnowledgeConfigError> {
