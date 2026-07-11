@@ -49,7 +49,7 @@ async fn seed_legacy_assistant_identity(pool: &sqlx::SqlitePool) {
     .unwrap();
 
     for (id, backend, agent_type, name, source, sort_order) in [
-        ("agent-aionrs", "", "aionrs", "Aion CLI", "internal", 100),
+        ("agent-aionrs", "", "aionrs", "CentaurAI Core", "internal", 100),
         ("agent-codex", "codex", "acp", "Codex CLI", "builtin", 200),
         ("agent-claude", "claude", "acp", "Claude Code", "builtin", 210),
     ] {

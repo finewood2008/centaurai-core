@@ -7,9 +7,11 @@ mod convert;
 pub mod error;
 pub(crate) mod message_cursor;
 mod message_persistence;
+pub mod model_routing;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
+pub mod run_scheduler;
 mod runtime_completion;
 mod runtime_persistence;
 pub mod runtime_state;
@@ -28,9 +30,11 @@ mod turn_orchestrator;
 mod turn_recovery_policy;
 
 pub use error::ConversationError;
+pub use model_routing::{ConversationModelLease, ConversationModelRequirements, ConversationModelRouteResolver};
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
+pub use run_scheduler::{AgentRunScheduler, RunAdmissionError};
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,

@@ -19,9 +19,16 @@ pub struct ConversationRuntimeStateService {
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
+    queued_turns: HashMap<String, QueuedTurn>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
     shutting_down: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedTurn {
+    turn_id: String,
+    queued_at: i64,
 }
 
 #[derive(Debug)]
@@ -89,6 +96,13 @@ impl ConversationRuntimeStateService {
         state
             .active_turns
             .insert(conversation_id.to_owned(), turn_id.to_owned());
+        if state
+            .queued_turns
+            .get(conversation_id)
+            .is_some_and(|queued| queued.turn_id == turn_id)
+        {
+            state.queued_turns.remove(conversation_id);
+        }
 
         info!(conversation_id, turn_id, "conversation runtime turn claimed");
 
@@ -105,6 +119,58 @@ impl ConversationRuntimeStateService {
             .lock()
             .map(|state| state.active_turns.contains_key(conversation_id))
             .unwrap_or(false)
+    }
+
+    pub fn mark_queued(&self, conversation_id: &str, turn_id: &str, queued_at: i64) -> Result<(), ConversationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        if state.shutting_down || state.deleting_conversations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: "conversation runtime is unavailable".into(),
+            });
+        }
+        if state.active_turns.contains_key(conversation_id) || state.queued_turns.contains_key(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} already has a turn"),
+            });
+        }
+        state.queued_turns.insert(
+            conversation_id.to_owned(),
+            QueuedTurn {
+                turn_id: turn_id.to_owned(),
+                queued_at,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn clear_queued(&self, conversation_id: &str, turn_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| {
+                if state
+                    .queued_turns
+                    .get(conversation_id)
+                    .is_some_and(|queued| queued.turn_id == turn_id)
+                {
+                    state.queued_turns.remove(conversation_id);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn queued_turn_for(&self, conversation_id: &str) -> Option<(String, i64)> {
+        self.state.lock().ok().and_then(|state| {
+            state
+                .queued_turns
+                .get(conversation_id)
+                .map(|queued| (queued.turn_id.clone(), queued.queued_at))
+        })
     }
 
     pub fn active_turn_id_for(&self, conversation_id: &str) -> Option<String> {
@@ -248,19 +314,22 @@ impl ConversationRuntimeStateService {
         has_task: bool,
         pending_confirmations: usize,
     ) -> ConversationRuntimeSummary {
-        let (active_turn_id, cancelling) = self
+        let (active_turn_id, queued_turn, cancelling) = self
             .state
             .lock()
             .map(|state| {
                 (
                     state.active_turns.get(conversation_id).cloned(),
+                    state.queued_turns.get(conversation_id).cloned(),
                     state.cancelling_conversations.contains(conversation_id),
                 )
             })
-            .unwrap_or((None, false));
+            .unwrap_or((None, None, false));
         let claimed = active_turn_id.is_some();
 
-        let state = if pending_confirmations > 0 {
+        let state = if active_turn_id.is_none() && queued_turn.is_some() {
+            ConversationRuntimeStateKind::Queued
+        } else if pending_confirmations > 0 {
             ConversationRuntimeStateKind::WaitingConfirmation
         } else if cancelling {
             ConversationRuntimeStateKind::Cancelling
@@ -281,7 +350,12 @@ impl ConversationRuntimeStateService {
             task_status,
             is_processing,
             pending_confirmations,
-            turn_id: active_turn_id,
+            turn_id: active_turn_id.or_else(|| queued_turn.as_ref().map(|queued| queued.turn_id.clone())),
+            queue_position: None,
+            estimated_wait_ms: None,
+            queued_at: queued_turn.map(|queued| queued.queued_at),
+            effective_model: None,
+            fallback_used: None,
         }
     }
 

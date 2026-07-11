@@ -7,9 +7,6 @@ use tracing::{debug, info};
 
 use crate::task_manager::IWorkerTaskManager;
 
-/// Default idle timeout for ACP agents (5 minutes).
-const DEFAULT_IDLE_TIMEOUT_SECS: i64 = 5 * 60;
-
 /// Scan interval for idle agent cleanup (1 minute).
 const SCAN_INTERVAL_SECS: u64 = 60;
 
@@ -50,10 +47,13 @@ pub fn start_idle_scanner_with_coordinator(
     scan_interval_secs: Option<u64>,
     idle_cleanup_coordinator: Option<Arc<dyn IdleCleanupCoordinator>>,
 ) -> tokio::task::JoinHandle<()> {
-    let threshold = idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+    let configured_threshold_ms = idle_timeout_secs.map(|seconds| seconds * 1000);
+    let initial_threshold_ms = configured_threshold_ms
+        .map(|value| value as i64)
+        .unwrap_or_else(|| worker_task_manager.resident_idle_timeout_ms());
     let scan_interval = scan_interval_secs.unwrap_or(SCAN_INTERVAL_SECS);
     info!(
-        threshold_secs = threshold,
+        threshold_secs = initial_threshold_ms / 1000,
         scan_interval_secs = scan_interval,
         "Starting idle agent scanner"
     );
@@ -64,9 +64,12 @@ pub fn start_idle_scanner_with_coordinator(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let threshold_ms = configured_threshold_ms
+                        .map(|value| value as i64)
+                        .unwrap_or_else(|| worker_task_manager.resident_idle_timeout_ms());
                     scan_and_cleanup(
                         &worker_task_manager,
-                        threshold*1000,
+                        threshold_ms,
                         idle_cleanup_coordinator.clone(),
                     ).await;
                 }

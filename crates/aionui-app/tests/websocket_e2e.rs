@@ -26,6 +26,16 @@ struct TestApp {
 
 async fn start_app() -> TestApp {
     let db = aionui_db::init_database_memory().await.unwrap();
+    let now = aionui_common::now_ms();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('user1', 'testuser', 'test-password-hash', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
     let router = create_router(&services).await.expect("build router");
 
@@ -541,4 +551,15 @@ async fn t7_2_blacklisted_token_rejected() {
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
+}
+
+#[tokio::test]
+async fn t7_3_valid_token_for_deleted_user_is_rejected() {
+    let app = start_app().await;
+    let token = sign_token(&app, "deleted-user");
+
+    let (_write, mut read) = connect_bearer(app.addr, &token).await;
+    let msg = read_text(&mut read).await;
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
+    assert_eq!(read_close(&mut read).await, Some(1008));
 }

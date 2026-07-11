@@ -21,7 +21,7 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
 
     println!("cargo:rustc-env=BUILD_TIME={ts}");
-    println!("cargo:rustc-env=GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=CENTAURAI_CORE_COMMIT={commit}");
     println!("cargo:rerun-if-env-changed=CENTAURAI_CORE_COMMIT");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=build.rs");

@@ -2,6 +2,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
@@ -10,27 +11,35 @@ use aionui_ai_agent::{
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
+use crate::model_routing::{
+    ConversationModelLease, ConversationModelRequirements, ConversationModelRouteResolver, apply_physical_assignment,
+    logical_route_id,
+};
+use crate::run_scheduler::{AgentRunAdmission, AgentRunScheduler, NewAgentRun, RunAdmissionError};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
+    AgentRunListResponse, AgentRunStatus, AgentRuntimePolicyResponse, AgentRuntimeStatusResponse,
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
+    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding, UpdateAgentRuntimePolicyRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
+    PaginatedResult, WorkspacePathValidationError, generate_prefixed_id, generate_short_id, now_ms,
+    validate_workspace_path_availability,
 };
 use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
-    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    AgentBindingResolution, AgentRunRow, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
+    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
     MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
     resolve_agent_binding_from_rows,
@@ -60,6 +69,22 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
+fn capacity_error(error: RunAdmissionError) -> ConversationError {
+    let reason = match error {
+        RunAdmissionError::QueueFull => "The global agent run queue is full",
+        RunAdmissionError::UserLimit => "This user already has one active and one queued run",
+        RunAdmissionError::MemoryPressure => "New agent runs are paused because system memory usage is critical",
+        RunAdmissionError::QueueTimeout => "The agent run exceeded the maximum queue wait",
+        RunAdmissionError::Cancelled => "The queued agent run was cancelled",
+        RunAdmissionError::BackendRestarted => "The backend restarted before the agent run began",
+        RunAdmissionError::Persistence => "The agent run could not be persisted",
+    };
+    ConversationError::Capacity {
+        code: error.code(),
+        reason: reason.into(),
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -318,6 +343,8 @@ pub struct ConversationService {
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
+    run_scheduler: Option<Arc<AgentRunScheduler>>,
+    model_route_resolver: Option<Arc<dyn ConversationModelRouteResolver>>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
 
@@ -390,6 +417,8 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
+            run_scheduler: None,
+            model_route_resolver: None,
             runtime_helper_bin: None,
             runtime_base_url: None,
 
@@ -402,6 +431,102 @@ impl ConversationService {
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = runtime_state;
         self
+    }
+
+    pub fn with_run_scheduler(mut self, run_scheduler: Arc<AgentRunScheduler>) -> Self {
+        self.run_scheduler = Some(run_scheduler);
+        self
+    }
+
+    pub fn with_model_route_resolver(mut self, resolver: Arc<dyn ConversationModelRouteResolver>) -> Self {
+        self.model_route_resolver = Some(resolver);
+        self
+    }
+
+    fn start_confirmation_timeout_watchdog(
+        &self,
+        scheduler: &Arc<AgentRunScheduler>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        user_id: String,
+        conversation_id: String,
+        turn_id: String,
+    ) -> Arc<AtomicBool> {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let timed_out_for_task = Arc::clone(&timed_out);
+        let service = self.clone();
+        let timeout_ms = scheduler.policy().confirmation_timeout_ms;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+            let runtime = service.runtime_summary_for(&conversation_id).await;
+            if runtime.state != ConversationRuntimeStateKind::WaitingConfirmation
+                || runtime.turn_id.as_deref() != Some(turn_id.as_str())
+            {
+                return;
+            }
+            timed_out_for_task.store(true, Ordering::Release);
+            service.broadcaster.broadcast_to_user(
+                &user_id,
+                WebSocketMessage::new(
+                    "conversation.runTimedOut",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "turn_id": turn_id,
+                        "error_code": "CONFIRMATION_TIMEOUT",
+                    }),
+                ),
+            );
+            if let Err(error) = service
+                .cancel(&user_id, &conversation_id, &turn_id, &task_manager)
+                .await
+            {
+                warn!(conversation_id, turn_id, error = %error, "confirmation timeout cancellation failed");
+            }
+        });
+        timed_out
+    }
+
+    async fn acquire_model_route(
+        &self,
+        row: &ConversationRow,
+        request: &SendMessageRequest,
+        waited_ms: u64,
+        run_id: &str,
+    ) -> Result<(ConversationRow, Option<ConversationModelLease>), ConversationError> {
+        let (Some(resolver), Some(route_id)) = (&self.model_route_resolver, logical_route_id(row)) else {
+            return Ok((row.clone(), None));
+        };
+        let lease = resolver
+            .acquire(
+                &route_id,
+                &row.id,
+                ConversationModelRequirements {
+                    function_calling: true,
+                    vision: !request.files.is_empty(),
+                    context_tokens: 0,
+                    protocol: None,
+                    run_id: run_id.to_owned(),
+                    user_id: row.user_id.clone(),
+                },
+                waited_ms,
+            )
+            .await?;
+        self.broadcaster.broadcast_to_user(
+            &row.user_id,
+            WebSocketMessage::new(
+                if lease.fallback_used {
+                    "conversation.fallbackSelected"
+                } else {
+                    "conversation.effectiveModelSelected"
+                },
+                serde_json::json!({
+                    "conversation_id": row.id,
+                    "route_id": lease.route_id,
+                    "effective_model": lease.model,
+                    "fallback_used": lease.fallback_used,
+                }),
+            ),
+        );
+        Ok((apply_physical_assignment(row, &lease), Some(lease)))
     }
 
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
@@ -565,14 +690,136 @@ impl ConversationService {
         &self.task_manager
     }
 
+    pub async fn list_agent_runs(&self, user_id: &str) -> Result<AgentRunListResponse, ConversationError> {
+        match &self.run_scheduler {
+            Some(scheduler) => scheduler.list_for_user(user_id).await.map_err(capacity_error),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn recover_queued_agent_runs(&self) -> Result<usize, ConversationError> {
+        let Some(scheduler) = self.run_scheduler.clone() else {
+            return Ok(0);
+        };
+        let rows = scheduler.recover_after_restart().await.map_err(capacity_error)?;
+        let mut restored = 0;
+        for row in rows {
+            if self.restore_queued_agent_run(scheduler.clone(), row).await {
+                restored += 1;
+            }
+        }
+        Ok(restored)
+    }
+
+    async fn restore_queued_agent_run(&self, scheduler: Arc<AgentRunScheduler>, run: AgentRunRow) -> bool {
+        let conversation = match self.conversation_repo.get(&run.conversation_id).await {
+            Ok(Some(row)) if row.user_id == run.user_id => row,
+            _ => {
+                scheduler
+                    .finish(&run.id, AgentRunStatus::Failed, Some("CONVERSATION_NOT_FOUND"))
+                    .await;
+                return false;
+            }
+        };
+        let request = if run.source == "conversation" {
+            serde_json::from_str::<SendMessageRequest>(&run.request_json).ok()
+        } else {
+            serde_json::from_str::<serde_json::Value>(&run.request_json)
+                .ok()
+                .and_then(|value| {
+                    Some(SendMessageRequest {
+                        content: value.get("content")?.as_str()?.to_owned(),
+                        files: serde_json::from_value(value.get("files").cloned().unwrap_or_default()).ok()?,
+                        inject_skills: serde_json::from_value(value.get("inject_skills").cloned().unwrap_or_default())
+                            .ok()?,
+                        hidden: value
+                            .get("user_message_hidden")
+                            .and_then(|hidden| hidden.as_bool())
+                            .unwrap_or(false),
+                    })
+                })
+        };
+        let Some(request) = request else {
+            scheduler
+                .finish(&run.id, AgentRunStatus::Failed, Some("INVALID_PERSISTED_REQUEST"))
+                .await;
+            return false;
+        };
+        if self
+            .runtime_state
+            .mark_queued(&run.conversation_id, &run.turn_id, run.queued_at)
+            .is_err()
+        {
+            scheduler
+                .finish(&run.id, AgentRunStatus::Failed, Some("CONVERSATION_BUSY"))
+                .await;
+            return false;
+        }
+        let admission = scheduler.restore(run).await;
+        let service = self.clone();
+        let task_manager = self.task_manager.clone();
+        tokio::spawn(async move {
+            service
+                .execute_scheduled_message(scheduler, task_manager, conversation, request, admission)
+                .await;
+        });
+        true
+    }
+
+    pub fn agent_runtime_policy(&self) -> AgentRuntimePolicyResponse {
+        self.run_scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.policy().response())
+            .unwrap_or_else(|| crate::run_scheduler::RuntimePolicy::default().response())
+    }
+
+    pub async fn update_agent_runtime_policy(
+        &self,
+        update: UpdateAgentRuntimePolicyRequest,
+    ) -> AgentRuntimePolicyResponse {
+        match &self.run_scheduler {
+            Some(scheduler) => {
+                let response = scheduler.update_policy(update).await;
+                self.task_manager
+                    .configure_resident_policy(response.resident_task_limit, response.resident_idle_timeout_ms as i64);
+                response
+            }
+            None => crate::run_scheduler::RuntimePolicy::default().response(),
+        }
+    }
+
+    pub async fn agent_runtime_status(&self) -> AgentRuntimeStatusResponse {
+        match &self.run_scheduler {
+            Some(scheduler) => scheduler.status(self.task_manager.active_count()).await,
+            None => AgentRuntimeStatusResponse {
+                memory_used_percent: None,
+                memory_state: "disabled".into(),
+                configured_active_limit: 0,
+                effective_active_limit: 0,
+                active_count: 0,
+                queued_count: 0,
+                resident_task_count: self.task_manager.active_count(),
+            },
+        }
+    }
+
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
         let agent = self.task_manager.get_task(conversation_id);
         let has_task = agent.is_some();
         let task_status = agent.as_ref().and_then(|agent| agent.status());
         let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
 
-        self.runtime_state
-            .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
+        let mut summary =
+            self.runtime_state
+                .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations);
+        if let (Some(scheduler), Some(turn_id)) = (&self.run_scheduler, summary.turn_id.as_deref())
+            && summary.state == aionui_api_types::ConversationRuntimeStateKind::Queued
+            && let Some((position, wait_ms)) = scheduler.queue_details(turn_id).await
+        {
+            summary.queue_position = Some(position);
+            summary.estimated_wait_ms = Some(wait_ms);
+        }
+        summary
     }
 
     async fn send_message_response(
@@ -1173,7 +1420,7 @@ impl ConversationService {
             });
         }
 
-        self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
+        self.broadcast_list_changed(user_id, &response.id, "created", response.source.as_ref());
 
         log_conversation_created(&response, &extra);
 
@@ -1957,7 +2204,7 @@ impl ConversationService {
         let response = row_to_response(updated, &self.workspace_root)?;
 
         info!("Conversation updated");
-        self.broadcast_list_changed(id, "updated", response.source.as_ref());
+        self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
 
         Ok(response)
     }
@@ -2095,7 +2342,7 @@ impl ConversationService {
         }
 
         info!("Conversation deleted");
-        self.broadcast_list_changed(id, "deleted", source.as_ref());
+        self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
 
         Ok(())
     }
@@ -2554,6 +2801,283 @@ impl ConversationService {
 // ── Message Flow (send / stop / warmup) ─────────────────────────────
 
 impl ConversationService {
+    async fn enqueue_scheduled_message(
+        &self,
+        scheduler: Arc<AgentRunScheduler>,
+        user_id: &str,
+        row: ConversationRow,
+        req: SendMessageRequest,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        send_started_at: i64,
+    ) -> Result<SendMessageResponse, ConversationError> {
+        scheduler.preflight(user_id).await.map_err(capacity_error)?;
+
+        let turn_id = Self::mint_turn_id();
+        let run_id = generate_prefixed_id("run");
+        let user_msg_id = Self::mint_msg_id();
+        let queued_at = now_ms();
+        let user_msg = MessageRow {
+            id: user_msg_id.clone(),
+            conversation_id: row.id.clone(),
+            msg_id: Some(user_msg_id.clone()),
+            r#type: "text".into(),
+            content: serde_json::json!({ "content": req.content }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: req.hidden,
+            created_at: queued_at,
+        };
+        self.conversation_repo.insert_message(&user_msg).await?;
+
+        self.runtime_state.mark_queued(&row.id, &turn_id, queued_at)?;
+        let request_json = serde_json::to_string(&req)
+            .map_err(|error| ConversationError::internal(format!("Failed to serialize queued run: {error}")))?;
+        let admission = match scheduler
+            .enqueue(NewAgentRun {
+                run_id,
+                turn_id: turn_id.clone(),
+                user_id: user_id.to_owned(),
+                conversation_id: row.id.clone(),
+                source: "conversation".into(),
+                request_json,
+                message_id: Some(user_msg_id.clone()),
+                queued_at,
+            })
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.runtime_state.clear_queued(&row.id, &turn_id);
+                return Err(capacity_error(error));
+            }
+        };
+
+        self.broadcaster.broadcast_to_user(
+            user_id,
+            WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "conversation_id": row.id,
+                    "msg_id": user_msg_id,
+                    "content": req.content,
+                    "position": "right",
+                    "status": "finish",
+                    "hidden": req.hidden,
+                    "created_at": user_msg.created_at,
+                }),
+            ),
+        );
+
+        let response = SendMessageResponse {
+            msg_id: user_msg_id,
+            turn_id: turn_id.clone(),
+            runtime: self.runtime_summary_for(&row.id).await,
+        };
+        let service = self.clone();
+        tokio::spawn(async move {
+            service
+                .execute_scheduled_message(scheduler, task_manager, row, req, admission)
+                .await;
+        });
+        info!(
+            conversation_id = %response.runtime.turn_id.as_deref().unwrap_or_default(),
+            turn_id = %turn_id,
+            elapsed_ms = now_ms().saturating_sub(send_started_at),
+            "Message accepted into agent run scheduler"
+        );
+        Ok(response)
+    }
+
+    async fn execute_scheduled_message(
+        &self,
+        scheduler: Arc<AgentRunScheduler>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        row: ConversationRow,
+        req: SendMessageRequest,
+        admission: AgentRunAdmission,
+    ) {
+        let user_id = row.user_id.clone();
+        let conversation_id = row.id.clone();
+        let permit = match admission.permit.await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                self.runtime_state.clear_queued(&conversation_id, &admission.turn_id);
+                if matches!(
+                    error,
+                    RunAdmissionError::QueueTimeout | RunAdmissionError::BackendRestarted
+                ) {
+                    self.persist_run_terminal_tip(&user_id, &conversation_id, &admission.turn_id, error.code())
+                        .await;
+                }
+                false
+            }
+            Err(_) => {
+                self.runtime_state.clear_queued(&conversation_id, &admission.turn_id);
+                self.persist_run_terminal_tip(&user_id, &conversation_id, &admission.turn_id, "BACKEND_RESTARTED")
+                    .await;
+                false
+            }
+        };
+        if !permit {
+            return;
+        }
+
+        let turn_claim = match self.runtime_state.try_claim_turn(&conversation_id, &admission.turn_id) {
+            Ok(claim) => claim,
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    turn_id = %admission.turn_id,
+                    error = %error,
+                    "dispatched run could not claim conversation"
+                );
+                scheduler
+                    .finish(&admission.run_id, AgentRunStatus::Failed, Some("CONVERSATION_BUSY"))
+                    .await;
+                return;
+            }
+        };
+        scheduler.mark_running(&admission.run_id).await;
+
+        let (routed_row, model_lease) = match self
+            .acquire_model_route(
+                &row,
+                &req,
+                now_ms().saturating_sub(admission.queued_at).max(0) as u64,
+                &admission.run_id,
+            )
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let code = error.error_code();
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(&conversation_id, &admission.turn_id, was_deleting)
+                    .await;
+                scheduler
+                    .finish(&admission.run_id, AgentRunStatus::Failed, Some(code))
+                    .await;
+                self.persist_run_terminal_tip(&user_id, &conversation_id, &admission.turn_id, code)
+                    .await;
+                return;
+            }
+        };
+        if let Some(lease) = model_lease.as_ref() {
+            scheduler
+                .set_effective_model(&admission.run_id, &lease.model, lease.fallback_used)
+                .await;
+        }
+
+        let mut build_options = match self.build_task_options(&routed_row).await {
+            Ok(options) => options,
+            Err(error) => {
+                let top_level_code = error.error_code();
+                let send_error = AgentSendError::from_agent_error(error.to_agent_error());
+                self.persist_and_broadcast_send_failure_tip(
+                    &conversation_id,
+                    &admission.turn_id,
+                    &send_error,
+                    Some(top_level_code),
+                )
+                .await;
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(&conversation_id, &admission.turn_id, was_deleting)
+                    .await;
+                scheduler
+                    .finish(&admission.run_id, AgentRunStatus::Failed, Some(top_level_code))
+                    .await;
+                if let (Some(resolver), Some(lease)) = (&self.model_route_resolver, model_lease.as_ref()) {
+                    resolver.release(lease, 0).await;
+                }
+                return;
+            }
+        };
+        self.apply_conversation_runtime_context(&mut build_options, &user_id, &conversation_id);
+        self.ensure_workspace_skill_links(&routed_row, &build_options).await;
+        let stored_workspace = build_options.context.workspace.stored_path.clone();
+        let confirmation_timed_out = self.start_confirmation_timeout_watchdog(
+            &scheduler,
+            Arc::clone(&task_manager),
+            user_id.clone(),
+            conversation_id.clone(),
+            admission.turn_id.clone(),
+        );
+        let result = ConversationTurnOrchestrator::new(self.clone(), task_manager)
+            .run_user_turn(TurnStartInput {
+                user_id,
+                conversation: row,
+                request: req,
+                required_runtime_mode: None,
+                build_options,
+                stored_workspace,
+                turn_id: admission.turn_id,
+                turn_claim,
+            })
+            .await;
+        let (status, error_code) = if confirmation_timed_out.load(Ordering::Acquire) {
+            (AgentRunStatus::TimedOut, Some("CONFIRMATION_TIMEOUT"))
+        } else {
+            match result.status {
+                ConversationTurnStatus::Completed => (AgentRunStatus::Completed, None),
+                ConversationTurnStatus::Failed => (AgentRunStatus::Failed, Some("AGENT_TURN_FAILED")),
+            }
+        };
+        scheduler.finish(&admission.run_id, status, error_code).await;
+        if let (Some(resolver), Some(lease)) = (&self.model_route_resolver, model_lease.as_ref()) {
+            if result.status == ConversationTurnStatus::Failed {
+                resolver
+                    .record_failure(lease, result.error_message.as_deref().unwrap_or("agent turn failed"))
+                    .await;
+            } else {
+                resolver.release(lease, 0).await;
+            }
+        }
+    }
+
+    async fn persist_run_terminal_tip(&self, user_id: &str, conversation_id: &str, turn_id: &str, code: &str) {
+        let content = match code {
+            "RUN_QUEUE_TIMEOUT" => {
+                "This run waited too long in the queue. Your message was kept; retry when capacity is available."
+            }
+            "CONFIRMATION_TIMEOUT" => {
+                "This run was cancelled after waiting too long for confirmation. Retry when ready."
+            }
+            _ => "The backend restarted before this run began. Your message was kept; retry when ready.",
+        };
+        let msg_id = Self::mint_msg_id();
+        let row = MessageRow {
+            id: msg_id.clone(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: Some(msg_id.clone()),
+            r#type: "error".into(),
+            content: serde_json::json!({ "content": content, "code": code }).to_string(),
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: now_ms(),
+        };
+        if self.conversation_repo.insert_message(&row).await.is_ok() {
+            self.broadcaster.broadcast_to_user(
+                user_id,
+                WebSocketMessage::new(
+                    "message.stream",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "msg_id": msg_id,
+                        "turn_id": turn_id,
+                        "type": "error",
+                        "data": { "content": content, "code": code },
+                        "position": "left",
+                        "status": "finish",
+                        "replace": true,
+                    }),
+                ),
+            );
+        }
+    }
+
     /// Send a user message to the conversation.
     ///
     /// 1. Validates the conversation belongs to the user
@@ -2601,6 +3125,12 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
+        if let Some(scheduler) = self.run_scheduler.clone() {
+            return self
+                .enqueue_scheduled_message(scheduler, user_id, row, req, Arc::clone(task_manager), send_started_at)
+                .await;
+        }
+
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
 
@@ -2637,18 +3167,21 @@ impl ConversationService {
 
         info!(msg_id = %user_msg_id, "User message persisted");
 
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "message.userCreated",
-            serde_json::json!({
-                "conversation_id": conversation_id,
-                "msg_id": &user_msg_id,
-                "content": &req.content,
-                "position": "right",
-                "status": "finish",
-                "hidden": req.hidden,
-                "created_at": user_msg.created_at,
-            }),
-        ));
+        self.broadcaster.broadcast_to_user(
+            user_id,
+            WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "msg_id": &user_msg_id,
+                    "content": &req.content,
+                    "position": "right",
+                    "status": "finish",
+                    "hidden": req.hidden,
+                    "created_at": user_msg.created_at,
+                }),
+            ),
+        );
 
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
@@ -2727,6 +3260,10 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+
+        if let Some(scheduler) = self.run_scheduler.clone() {
+            return self.run_scheduled_internal_turn(scheduler, row, request).await;
+        }
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
@@ -2828,6 +3365,238 @@ impl ConversationService {
         })
     }
 
+    async fn run_scheduled_internal_turn(
+        &self,
+        scheduler: Arc<AgentRunScheduler>,
+        row: ConversationRow,
+        request: ConversationAgentTurnRequest,
+    ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
+        scheduler.preflight(&request.user_id).await.map_err(capacity_error)?;
+        let turn_id = Self::mint_turn_id();
+        let run_id = generate_prefixed_id("run");
+        let queued_at = now_ms();
+        let message_id = if request.persist_user_message {
+            let user_msg_id = Self::mint_msg_id();
+            let user_msg = MessageRow {
+                id: user_msg_id.clone(),
+                conversation_id: request.conversation_id.clone(),
+                msg_id: Some(user_msg_id.clone()),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": request.content }).to_string(),
+                position: Some("right".into()),
+                status: Some("finish".into()),
+                hidden: request.user_message_hidden,
+                created_at: queued_at,
+            };
+            self.conversation_repo.insert_message(&user_msg).await?;
+            Some(user_msg_id)
+        } else {
+            None
+        };
+        self.runtime_state
+            .mark_queued(&request.conversation_id, &turn_id, queued_at)?;
+        let request_json = serde_json::json!({
+            "content": request.content,
+            "files": request.files,
+            "inject_skills": request.inject_skills,
+            "required_runtime_mode": request.required_runtime_mode,
+            "user_message_hidden": request.user_message_hidden,
+        })
+        .to_string();
+        let admission = match scheduler
+            .enqueue(NewAgentRun {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                user_id: request.user_id.clone(),
+                conversation_id: request.conversation_id.clone(),
+                source: "internal".into(),
+                request_json,
+                message_id,
+                queued_at,
+            })
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.runtime_state.clear_queued(&request.conversation_id, &turn_id);
+                return Err(capacity_error(error));
+            }
+        };
+
+        match admission.permit.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.runtime_state.clear_queued(&request.conversation_id, &turn_id);
+                return Ok(ConversationAgentTurnOutcome {
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id,
+                    status: ConversationAgentTurnStatus::Failed,
+                    error_message: Some(capacity_error(error).to_string()),
+                    runtime: self.runtime_summary_for(&request.conversation_id).await,
+                });
+            }
+            Err(_) => {
+                self.runtime_state.clear_queued(&request.conversation_id, &turn_id);
+                return Ok(ConversationAgentTurnOutcome {
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id,
+                    status: ConversationAgentTurnStatus::Failed,
+                    error_message: Some("Backend restarted before dispatch".into()),
+                    runtime: self.runtime_summary_for(&request.conversation_id).await,
+                });
+            }
+        }
+
+        let turn_claim = match self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id) {
+            Ok(claim) => claim,
+            Err(error) => {
+                scheduler
+                    .finish(&run_id, AgentRunStatus::Failed, Some("CONVERSATION_BUSY"))
+                    .await;
+                return Err(error);
+            }
+        };
+        scheduler.mark_running(&run_id).await;
+        if let Some(on_started) = request.on_started.as_ref() {
+            on_started(ConversationAgentTurnStarted {
+                conversation_id: request.conversation_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await;
+        }
+
+        let route_request = SendMessageRequest {
+            content: request.content.clone(),
+            files: request.files.clone(),
+            inject_skills: request.inject_skills.clone(),
+            hidden: request.user_message_hidden,
+        };
+        let (routed_row, model_lease) = match self
+            .acquire_model_route(
+                &row,
+                &route_request,
+                now_ms().saturating_sub(queued_at).max(0) as u64,
+                &run_id,
+            )
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let code = error.error_code();
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
+                    .await;
+                scheduler.finish(&run_id, AgentRunStatus::Failed, Some(code)).await;
+                return Ok(ConversationAgentTurnOutcome {
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id,
+                    status: ConversationAgentTurnStatus::Failed,
+                    error_message: Some(error.to_string()),
+                    runtime: self.runtime_summary_for(&request.conversation_id).await,
+                });
+            }
+        };
+        if let Some(lease) = model_lease.as_ref() {
+            scheduler
+                .set_effective_model(&run_id, &lease.model, lease.fallback_used)
+                .await;
+        }
+
+        let mut build_options = match self.build_task_options(&routed_row).await {
+            Ok(options) => options,
+            Err(error) => {
+                let top_level_code = error.error_code();
+                let send_error = AgentSendError::from_agent_error(error.to_agent_error());
+                self.persist_and_broadcast_send_failure_tip(
+                    &request.conversation_id,
+                    &turn_id,
+                    &send_error,
+                    Some(top_level_code),
+                )
+                .await;
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(&request.conversation_id, &turn_id, was_deleting)
+                    .await;
+                scheduler
+                    .finish(&run_id, AgentRunStatus::Failed, Some(top_level_code))
+                    .await;
+                if let (Some(resolver), Some(lease)) = (&self.model_route_resolver, model_lease.as_ref()) {
+                    resolver.release(lease, 0).await;
+                }
+                return Ok(ConversationAgentTurnOutcome {
+                    conversation_id: request.conversation_id.clone(),
+                    turn_id,
+                    status: ConversationAgentTurnStatus::Failed,
+                    error_message: Some(send_error_display_message(&send_error)),
+                    runtime: self.runtime_summary_for(&request.conversation_id).await,
+                });
+            }
+        };
+        self.apply_conversation_runtime_context(&mut build_options, &request.user_id, &request.conversation_id);
+        self.ensure_workspace_skill_links(&routed_row, &build_options).await;
+        let stored_workspace = build_options.context.workspace.stored_path.clone();
+        let conversation_id = request.conversation_id.clone();
+        let confirmation_timed_out = self.start_confirmation_timeout_watchdog(
+            &scheduler,
+            Arc::clone(&self.task_manager),
+            request.user_id.clone(),
+            conversation_id.clone(),
+            turn_id.clone(),
+        );
+        let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
+            .run_user_turn(TurnStartInput {
+                user_id: request.user_id,
+                conversation: row,
+                request: SendMessageRequest {
+                    content: request.content,
+                    files: request.files,
+                    inject_skills: request.inject_skills,
+                    hidden: request.user_message_hidden,
+                },
+                required_runtime_mode: request.required_runtime_mode,
+                build_options,
+                stored_workspace,
+                turn_id: turn_id.clone(),
+                turn_claim,
+            })
+            .await;
+        let status = if confirmation_timed_out.load(Ordering::Acquire) {
+            AgentRunStatus::TimedOut
+        } else {
+            match result.status {
+                ConversationTurnStatus::Completed => AgentRunStatus::Completed,
+                ConversationTurnStatus::Failed => AgentRunStatus::Failed,
+            }
+        };
+        let error_code = match status {
+            AgentRunStatus::TimedOut => Some("CONFIRMATION_TIMEOUT"),
+            AgentRunStatus::Failed => Some("AGENT_TURN_FAILED"),
+            _ => None,
+        };
+        scheduler.finish(&run_id, status, error_code).await;
+        if let (Some(resolver), Some(lease)) = (&self.model_route_resolver, model_lease.as_ref()) {
+            if result.status == ConversationTurnStatus::Failed {
+                resolver
+                    .record_failure(lease, result.error_message.as_deref().unwrap_or("agent turn failed"))
+                    .await;
+            } else {
+                resolver.release(lease, 0).await;
+            }
+        }
+        Ok(ConversationAgentTurnOutcome {
+            conversation_id: conversation_id.clone(),
+            turn_id,
+            status: match result.status {
+                ConversationTurnStatus::Completed => ConversationAgentTurnStatus::Completed,
+                ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
+            },
+            error_message: result.error_message,
+            runtime: self.runtime_summary_for(&conversation_id).await,
+        })
+    }
+
     pub async fn latest_conversation_error_message(
         &self,
         conversation_id: &str,
@@ -2863,7 +3632,14 @@ impl ConversationService {
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
-        self.broadcaster.broadcast(WebSocketMessage::new(
+        let owner = self
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|conversation| conversation.user_id);
+        let event = WebSocketMessage::new(
             "message.stream",
             serde_json::json!({
                 "conversation_id": row.conversation_id,
@@ -2876,7 +3652,12 @@ impl ConversationService {
                 "hidden": row.hidden,
                 "replace": true,
             }),
-        ));
+        );
+        if let Some(user_id) = owner {
+            self.broadcaster.broadcast_to_user(&user_id, event);
+        } else {
+            self.broadcaster.broadcast_to_admins(event);
+        }
     }
 
     /// Insert a pre-built `MessageRow` into the conversation's message history
@@ -2902,8 +3683,10 @@ impl ConversationService {
             "hidden": row.hidden,
             "replace": true,
         });
-        self.broadcaster
-            .broadcast(WebSocketMessage::new("message.stream", payload));
+        let event = WebSocketMessage::new("message.stream", payload);
+        if let Some(owner) = self.conversation_repo.get(&row.conversation_id).await? {
+            self.broadcaster.broadcast_to_user(&owner.user_id, event);
+        }
         Ok(())
     }
 
@@ -2924,6 +3707,19 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        if let Some(scheduler) = &self.run_scheduler
+            && scheduler
+                .cancel_queued(user_id, turn_id)
+                .await
+                .map_err(capacity_error)?
+        {
+            self.runtime_state.clear_queued(conversation_id, turn_id);
+            info!(conversation_id, turn_id, "Queued agent run cancelled");
+            return Ok(CancelConversationResponse {
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
 
         let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
         if active_turn_id.as_deref() != Some(turn_id) {
@@ -3359,6 +4155,7 @@ impl ConversationService {
     /// Broadcast a `conversation.listChanged` WebSocket event.
     pub(crate) fn broadcast_list_changed(
         &self,
+        user_id: &str,
         conversation_id: &str,
         action: &str,
         source: Option<&ConversationSource>,
@@ -3369,7 +4166,7 @@ impl ConversationService {
             "source": source,
         });
         let event = WebSocketMessage::new("conversation.listChanged", payload);
-        self.broadcaster.broadcast(event);
+        self.broadcaster.broadcast_to_user(user_id, event);
     }
 
     pub(crate) fn skill_resolver(&self) -> Arc<dyn SkillResolver> {

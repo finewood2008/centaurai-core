@@ -1,10 +1,10 @@
 # Architecture
 
 CentaurAI Core is the shared backend server for CentaurAI products, built with Rust
-(Axum + Tokio + SQLite). It is maintained as a downstream fork of AionCore and
-preserves the compatible HTTP REST API and WebSocket event boundary during the
-migration. Internal `aionui-*` crate names remain unchanged initially to keep
-upstream synchronization and data compatibility tractable.
+(Axum + Tokio + SQLite). It provides HTTP REST APIs and WebSocket real-time
+events for CentaurAI clients. Internal `aionui-*` crate names remain unchanged
+for source and data compatibility while the public product identity is
+CentaurAI Core.
 
 ## Tech Stack
 

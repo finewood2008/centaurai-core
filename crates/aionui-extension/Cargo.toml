@@ -33,6 +33,9 @@ zip.workspace = true
 [target.'cfg(windows)'.dependencies]
 junction = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true
 http-body-util.workspace = true

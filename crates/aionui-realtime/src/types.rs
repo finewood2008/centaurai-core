@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use aionui_api_types::WebSocketMessage;
 use tokio::sync::mpsc;
 
 /// Unique identifier for a WebSocket connection.
@@ -25,6 +26,42 @@ pub enum WsOutbound {
     Close(WebSocketCloseCode, String),
     /// UTF-8 text frame followed immediately by a close frame.
     TextThenClose(String, WebSocketCloseCode, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealtimeIdentity {
+    pub user_id: String,
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventAudience {
+    Global,
+    User(String),
+    Admin,
+}
+
+#[derive(Debug, Clone)]
+pub struct RealtimeEvent {
+    pub audience: EventAudience,
+    pub message: WebSocketMessage<serde_json::Value>,
+}
+
+impl RealtimeEvent {
+    pub fn global(message: WebSocketMessage<serde_json::Value>) -> Self {
+        Self {
+            audience: EventAudience::Global,
+            message,
+        }
+    }
+}
+
+impl std::ops::Deref for RealtimeEvent {
+    type Target = WebSocketMessage<serde_json::Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
 }
 
 /// WebSocket close codes per RFC 6455.
@@ -144,6 +181,9 @@ pub struct ClientInfo {
     pub last_ping: Instant,
     /// Sender for outbound messages to this connection.
     pub tx: mpsc::Sender<WsOutbound>,
+    /// Authenticated seat bound to this connection.
+    pub user_id: String,
+    pub is_admin: bool,
 }
 
 /// Server sends ping every 30 seconds.

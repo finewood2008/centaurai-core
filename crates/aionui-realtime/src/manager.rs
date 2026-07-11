@@ -11,7 +11,8 @@ use tracing::{debug, info, warn};
 
 use crate::broadcaster::EventBroadcaster;
 use crate::types::{
-    ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RealtimeError, WebSocketCloseCode, WsOutbound,
+    ClientInfo, ConnectionId, EventAudience, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RealtimeError, RealtimeEvent,
+    RealtimeIdentity, WebSocketCloseCode, WsOutbound,
 };
 
 /// Validates whether a JWT token is still valid.
@@ -35,11 +36,29 @@ impl WebSocketManager {
 
     /// Register a new client connection and return its assigned ID.
     pub fn add_client(&self, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
+        self.add_client_with_identity(
+            token,
+            RealtimeIdentity {
+                user_id: "system_default_user".into(),
+                is_admin: true,
+            },
+            tx,
+        )
+    }
+
+    pub fn add_client_with_identity(
+        &self,
+        token: String,
+        identity: RealtimeIdentity,
+        tx: mpsc::Sender<WsOutbound>,
+    ) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let info = ClientInfo {
             token,
             last_ping: Instant::now(),
             tx,
+            user_id: identity.user_id,
+            is_admin: identity.is_admin,
         };
         self.connections.insert(id, info);
         debug!(%id, "client added");
@@ -72,6 +91,11 @@ impl WebSocketManager {
     /// broadcast backpressure is logged and the connection is left alive.
     /// Closed channels trigger client removal.
     pub fn broadcast_all(&self, msg: WebSocketMessage<serde_json::Value>) {
+        self.broadcast_event(RealtimeEvent::global(msg));
+    }
+
+    pub fn broadcast_event(&self, event: RealtimeEvent) {
+        let msg = event.message;
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
             Err(e) => {
@@ -82,6 +106,14 @@ impl WebSocketManager {
 
         let mut disconnected = Vec::new();
         for entry in self.connections.iter() {
+            let permitted = match &event.audience {
+                EventAudience::Global => true,
+                EventAudience::User(user_id) => entry.value().user_id == *user_id,
+                EventAudience::Admin => entry.value().is_admin,
+            };
+            if !permitted {
+                continue;
+            }
             let conn_id = *entry.key();
             match entry.value().tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
@@ -172,6 +204,20 @@ impl Default for WebSocketManager {
 impl EventBroadcaster for WebSocketManager {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
         self.broadcast_all(event);
+    }
+
+    fn broadcast_to_user(&self, user_id: &str, event: WebSocketMessage<serde_json::Value>) {
+        self.broadcast_event(RealtimeEvent {
+            audience: EventAudience::User(user_id.to_owned()),
+            message: event,
+        });
+    }
+
+    fn broadcast_to_admins(&self, event: WebSocketMessage<serde_json::Value>) {
+        self.broadcast_event(RealtimeEvent {
+            audience: EventAudience::Admin,
+            message: event,
+        });
     }
 }
 
@@ -367,6 +413,54 @@ mod tests {
     }
 
     #[test]
+    fn user_and_admin_audiences_do_not_leak_between_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx_a, mut rx_a) = new_client_tx();
+        let (tx_b, mut rx_b) = new_client_tx();
+        let (tx_admin, mut rx_admin) = new_client_tx();
+        mgr.add_client_with_identity(
+            "a".into(),
+            RealtimeIdentity {
+                user_id: "user-a".into(),
+                is_admin: false,
+            },
+            tx_a,
+        );
+        mgr.add_client_with_identity(
+            "b".into(),
+            RealtimeIdentity {
+                user_id: "user-b".into(),
+                is_admin: false,
+            },
+            tx_b,
+        );
+        mgr.add_client_with_identity(
+            "admin".into(),
+            RealtimeIdentity {
+                user_id: "system_default_user".into(),
+                is_admin: true,
+            },
+            tx_admin,
+        );
+
+        mgr.broadcast_event(RealtimeEvent {
+            audience: EventAudience::User("user-a".into()),
+            message: WebSocketMessage::new("private", json!({"owner": "a"})),
+        });
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
+        assert!(rx_admin.try_recv().is_err());
+
+        mgr.broadcast_event(RealtimeEvent {
+            audience: EventAudience::Admin,
+            message: WebSocketMessage::new("capacity", json!({"active": 4})),
+        });
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+        assert!(rx_admin.try_recv().is_ok());
+    }
+
+    #[test]
     fn broadcast_all_removes_closed_channels() {
         let mgr = WebSocketManager::new();
         let (tx1, rx1) = new_client_tx();
@@ -443,6 +537,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 token: "valid".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: Instant::now(),
                 tx,
             },
@@ -477,6 +573,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 token: "valid".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: old_ping,
                 tx,
             },
@@ -508,6 +606,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 token: "expired-token".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: Instant::now(),
                 tx,
             },
@@ -541,6 +641,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 token: "expired-token".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: Instant::now(),
                 tx,
             },
@@ -564,6 +666,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 token: "expired".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: old_ping,
                 tx,
             },
@@ -597,6 +701,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 token: "good".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: Instant::now(),
                 tx: tx1,
             },
@@ -608,6 +714,8 @@ mod tests {
             ConnectionId(2),
             ClientInfo {
                 token: "good".into(),
+                user_id: "system_default_user".into(),
+                is_admin: true,
                 last_ping: Instant::now() - (HEARTBEAT_TIMEOUT * 2),
                 tx: tx2,
             },

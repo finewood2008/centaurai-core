@@ -8,6 +8,7 @@ mod extract;
 mod jwt;
 pub mod middleware;
 mod password;
+mod proxy_identity;
 pub mod qr_token;
 mod rate_limit;
 mod routes;
@@ -25,6 +26,7 @@ pub use password::{
     dummy_password_hash, generate_password, generate_user_credentials, hash_password, verify_password,
     verify_password_timed,
 };
+pub use proxy_identity::{ProxyIdentity, ProxyIdentityError, ProxyIdentityVerifier};
 
 // Validation
 pub use validation::{validate_password, validate_username};

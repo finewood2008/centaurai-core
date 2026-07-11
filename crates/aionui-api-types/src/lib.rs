@@ -18,6 +18,7 @@ mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
+mod model_route;
 mod office;
 mod provider;
 mod remote_agent;
@@ -74,14 +75,16 @@ pub use channel::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ActiveCountResponse, AgentRunListResponse, AgentRunResponse, AgentRunStatus, AgentRuntimeMode,
+    AgentRuntimePolicyResponse, AgentRuntimeStatusResponse, AssistantConversationOverridesRequest,
+    AssistantConversationRequest, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
+    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, UpdateAgentRuntimePolicyRequest, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
@@ -113,6 +116,10 @@ pub use mcp::{
     ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode, McpConnectionTestResult, McpServerResponse,
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+};
+pub use model_route::{
+    CreateModelRouteRequest, EffectiveModelAssignmentResponse, ModelRouteMemberHealthRequest, ModelRouteMemberResponse,
+    ModelRouteResponse, UpdateModelRouteRequest, UpsertModelRouteMemberRequest,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,

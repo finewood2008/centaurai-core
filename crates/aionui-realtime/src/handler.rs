@@ -5,20 +5,24 @@ use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::manager::{TokenValidator, WebSocketManager};
 use crate::router::MessageRouter;
-use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound};
+use crate::types::{
+    ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, RealtimeIdentity, WebSocketCloseCode, WsOutbound,
+};
 
 /// Extracts a JWT token from WebSocket upgrade request headers.
 ///
 /// Injected by `aionui-app` — wraps `aionui_auth::extract_token_from_ws_headers`
 /// so that `aionui-realtime` does not depend on `aionui-auth` directly.
 pub type TokenExtractor = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
+pub type ConnectionIdentityResolver =
+    Arc<dyn Fn(HeaderMap, String) -> BoxFuture<'static, Option<RealtimeIdentity>> + Send + Sync>;
 
 /// Shared state required by the WebSocket upgrade handler.
 #[derive(Clone)]
@@ -27,6 +31,7 @@ pub struct WsHandlerState {
     pub router: Arc<dyn MessageRouter>,
     pub token_validator: TokenValidator,
     pub token_extractor: TokenExtractor,
+    pub identity_resolver: ConnectionIdentityResolver,
 }
 
 /// Axum handler for HTTP → WebSocket upgrade.
@@ -43,6 +48,10 @@ pub async fn ws_upgrade_handler(
     axum::extract::State(state): axum::extract::State<WsHandlerState>,
 ) -> impl IntoResponse {
     let token = (state.token_extractor)(&headers);
+    let identity = match token.as_ref() {
+        Some(token) => (state.identity_resolver)(headers.clone(), token.clone()).await,
+        None => None,
+    };
 
     // Echo Sec-WebSocket-Protocol so clients using it for auth
     // receive a valid subprotocol negotiation response.
@@ -57,14 +66,19 @@ pub async fn ws_upgrade_handler(
     };
 
     ws.on_upgrade(move |socket| async move {
-        handle_socket(socket, token, state).await;
+        handle_socket(socket, token, identity, state).await;
     })
 }
 
 /// Post-upgrade connection handler.
 ///
 /// Validates the token, registers the client, spawns send/recv loops.
-async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandlerState) {
+async fn handle_socket(
+    socket: WebSocket,
+    token: Option<String>,
+    identity: Option<RealtimeIdentity>,
+    state: WsHandlerState,
+) {
     let Some(token) = token else {
         send_realtime_error_and_close(socket, RealtimeError::AuthMissing, "authentication required").await;
         return;
@@ -74,9 +88,13 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
         return;
     }
+    let Some(identity) = identity else {
+        send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "identity validation failed").await;
+        return;
+    };
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
-    let conn_id = state.manager.add_client(token, tx);
+    let conn_id = state.manager.add_client_with_identity(token, identity, tx);
 
     info!(%conn_id, "websocket connection established");
 
@@ -261,6 +279,14 @@ mod tests {
             router: Arc::new(crate::router::NoopMessageRouter),
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| None),
+            identity_resolver: Arc::new(|_, _| {
+                Box::pin(async {
+                    Some(RealtimeIdentity {
+                        user_id: "test".into(),
+                        is_admin: false,
+                    })
+                })
+            }),
         }
     }
 
@@ -506,6 +532,14 @@ mod tests {
             router: router.clone(),
             token_validator: Arc::new(|_| true),
             token_extractor: Arc::new(|_| None),
+            identity_resolver: Arc::new(|_, _| {
+                Box::pin(async {
+                    Some(RealtimeIdentity {
+                        user_id: "test".into(),
+                        is_admin: false,
+                    })
+                })
+            }),
         };
 
         handle_text_message(

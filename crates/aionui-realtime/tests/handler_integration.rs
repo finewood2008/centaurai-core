@@ -44,6 +44,14 @@ fn default_state() -> (WsHandlerState, Arc<WebSocketManager>) {
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(|s| s.to_owned())
         }),
+        identity_resolver: Arc::new(|_, _| {
+            Box::pin(async {
+                Some(aionui_realtime::RealtimeIdentity {
+                    user_id: "test-user".into(),
+                    is_admin: false,
+                })
+            })
+        }),
     };
     (state, manager)
 }
@@ -402,6 +410,14 @@ async fn unknown_message_routed_to_message_router() {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(|s| s.to_owned())
+        }),
+        identity_resolver: Arc::new(|_, _| {
+            Box::pin(async {
+                Some(aionui_realtime::RealtimeIdentity {
+                    user_id: "test-user".into(),
+                    is_admin: false,
+                })
+            })
         }),
     };
 

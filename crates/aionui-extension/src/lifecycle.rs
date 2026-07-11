@@ -1,4 +1,7 @@
+use std::future::Future;
+use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use aionui_runtime::Builder as CmdBuilder;
 use tracing::{info, warn};
@@ -9,6 +12,11 @@ use crate::constants::{
 };
 use crate::error::ExtensionError;
 use crate::types::LifecycleHooks;
+
+/// A just-installed executable can briefly return `ETXTBSY` on Unix while a
+/// concurrent writer or filesystem scanner still holds it open. Keep retries
+/// short and bounded; all attempts remain inside the hook's existing timeout.
+const HOOK_ETXTBSY_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(25)];
 
 /// Which lifecycle hook to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +98,27 @@ pub async fn execute_hook(
         "executing lifecycle hook"
     );
 
-    let mut builder = CmdBuilder::clean_cli(&script);
-    builder.current_dir(ext_dir);
-    let child_future = builder.output();
+    let child_future = retry_text_file_busy(
+        || {
+            let mut builder = CmdBuilder::clean_cli(&script);
+            builder.current_dir(ext_dir);
+            builder.output()
+        },
+        |attempt, delay, error| {
+            warn!(
+                extension = extension_name,
+                hook = label,
+                path = %script.display(),
+                attempt,
+                max_attempts = HOOK_ETXTBSY_RETRY_DELAYS.len() + 1,
+                retry_after_ms = delay.as_millis(),
+                raw_os_error = ?error.raw_os_error(),
+                "lifecycle hook executable is temporarily busy; retrying"
+            );
+        },
+    );
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child_future).await;
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), child_future).await;
 
     match result {
         Err(_elapsed) => {
@@ -154,6 +178,38 @@ pub async fn execute_hook(
     }
 }
 
+async fn retry_text_file_busy<T, F, Fut, R>(mut operation: F, mut on_retry: R) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+    R: FnMut(usize, Duration, &io::Error),
+{
+    for (retry_index, delay) in HOOK_ETXTBSY_RETRY_DELAYS.iter().enumerate() {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_text_file_busy(&error) => {
+                on_retry(retry_index + 1, *delay, &error);
+                tokio::time::sleep(*delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    operation().await
+}
+
+fn is_text_file_busy(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Determine whether the `onInstall` hook should run.
 ///
 /// Returns `true` when:
@@ -170,6 +226,69 @@ pub fn needs_install_hook(current_version: &str, persisted_version: Option<&str>
 mod tests {
     use super::*;
     use tokio::process::Command;
+
+    fn fixture_script(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lifecycle")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_text_file_busy_retries_until_third_attempt_succeeds() {
+        let mut attempts = 0;
+        let result = retry_text_file_busy(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts < 3 {
+                    Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+                } else {
+                    Ok(())
+                })
+            },
+            |_, _, _| {},
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_text_file_busy_retry_is_bounded_to_three_attempts() {
+        let mut attempts = 0;
+        let result: io::Result<()> = retry_text_file_busy(
+            || {
+                attempts += 1;
+                std::future::ready(Err(io::Error::from_raw_os_error(libc::ETXTBSY)))
+            },
+            |_, _, _| {},
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_other_spawn_errors_are_not_retried() {
+        let mut attempts = 0;
+        let result: io::Result<()> = retry_text_file_busy(
+            || {
+                attempts += 1;
+                std::future::ready(Err(io::Error::from_raw_os_error(libc::EACCES)))
+            },
+            |_, _, _| {},
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert_eq!(attempts, 1);
+    }
 
     // -----------------------------------------------------------------------
     // needs_install_hook
@@ -267,33 +386,19 @@ mod tests {
     #[tokio::test]
     async fn test_execute_hook_success() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("hook.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let script_path = fixture_script("success.sh");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let result = execute_hook(dir.path(), &script_path, HookKind::OnActivate, "test-ext").await;
 
-        let result = execute_hook(dir.path(), "hook.sh", HookKind::OnActivate, "test-ext").await;
-
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "success hook failed: {result:?}");
     }
 
     #[tokio::test]
     async fn test_execute_hook_nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("fail.sh");
-        std::fs::write(&script_path, "#!/bin/sh\necho 'something broke' >&2\nexit 1\n").unwrap();
+        let script_path = fixture_script("fail.sh");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let result = execute_hook(dir.path(), "fail.sh", HookKind::OnInstall, "test-ext").await;
+        let result = execute_hook(dir.path(), &script_path, HookKind::OnInstall, "test-ext").await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -304,7 +409,7 @@ mod tests {
             } => {
                 assert_eq!(extension_name, "test-ext");
                 assert_eq!(hook, "onInstall");
-                assert!(reason.contains("something broke"));
+                assert!(reason.contains("setup failed"));
             }
             other => panic!("expected HookFailed, got {other:?}"),
         }
@@ -313,21 +418,13 @@ mod tests {
     #[tokio::test]
     async fn test_execute_hook_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("slow.sh");
-        // Script that sleeps longer than we allow
-        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script_path = fixture_script("slow.sh");
 
         // Use a very short timeout override via a direct timeout wrapper
         let ext_dir = dir.path().to_owned();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            Command::new(ext_dir.join("slow.sh"))
+            Command::new(script_path)
                 .current_dir(&ext_dir)
                 .kill_on_drop(true)
                 .output(),
@@ -340,20 +437,12 @@ mod tests {
     #[tokio::test]
     async fn test_execute_hook_working_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("cwd_marker.txt");
-        let script_path = dir.path().join("check_cwd.sh");
-        // Write cwd to a file so we can verify it
-        std::fs::write(&script_path, "#!/bin/sh\npwd > cwd_marker.txt\n").unwrap();
+        let script_path = fixture_script("cwd.sh");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let result = execute_hook(dir.path(), &script_path, HookKind::OnActivate, "test-ext").await;
 
-        let result = execute_hook(dir.path(), "check_cwd.sh", HookKind::OnActivate, "test-ext").await;
-
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "working-directory hook failed: {result:?}");
+        let marker = dir.path().join("cwd_out.txt");
         assert!(marker.exists());
         let cwd_content = std::fs::read_to_string(&marker).unwrap();
         // The cwd written by the script should match the extension dir

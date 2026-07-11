@@ -10,15 +10,21 @@ use aionui_ai_agent::{
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
-use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
+use aionui_conversation::{
+    AgentRunScheduler, ConversationModelRouteResolver, ConversationService,
+    runtime_state::ConversationRuntimeStateService,
+};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, IAgentRunRepository, IConversationRepository,
+    IMcpServerRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAgentRunRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository,
+    SqliteModelRouteRepository, SqliteProviderRepository, SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_system::ModelRouteService;
+
+use crate::router::model_route_adapter::AppModelRouteResolver;
 
 pub struct AppServices {
     pub database: Database,
@@ -32,6 +38,9 @@ pub struct AppServices {
     pub active_lease_registry: Arc<ActiveLeaseRegistry>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub agent_run_scheduler: Arc<AgentRunScheduler>,
+    pub model_route_service: ModelRouteService,
+    pub model_route_resolver: Arc<dyn ConversationModelRouteResolver>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -80,6 +89,8 @@ impl AppServices {
             worker_task_manager: self.worker_task_manager.clone(),
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
+            agent_run_scheduler: self.agent_run_scheduler.clone(),
+            model_route_resolver: self.model_route_resolver.clone(),
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
@@ -121,7 +132,21 @@ impl AppServices {
         let encryption_key = derive_encryption_key(&secret);
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let model_route_service = ModelRouteService::new(
+            Arc::new(SqliteModelRouteRepository::new(database.pool().clone())),
+            provider_repo.clone(),
+        );
+        let model_route_resolver: Arc<dyn ConversationModelRouteResolver> =
+            Arc::new(AppModelRouteResolver::new(model_route_service.clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
+        let agent_run_repo: Arc<dyn IAgentRunRepository> =
+            Arc::new(SqliteAgentRunRepository::new(database.pool().clone()));
+        let agent_run_scheduler = AgentRunScheduler::new(agent_run_repo, event_bus.clone());
+        agent_run_scheduler
+            .load_policy()
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to load agent runtime policy: {}", error.code()))?;
+        agent_run_scheduler.start_maintenance();
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -166,7 +191,7 @@ impl AppServices {
 
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
-            provider_repo,
+            provider_repo: provider_repo.clone(),
             encryption_key,
             agent_registry: agent_registry.clone(),
             acp_agent_service: acp_agent_service.clone(),
@@ -185,6 +210,11 @@ impl AppServices {
             factory,
             active_lease_registry.clone(),
         ));
+        let resident_policy = agent_run_scheduler.policy();
+        task_manager_concrete.configure_resident_policy(
+            resident_policy.resident_task_limit,
+            resident_policy.resident_idle_timeout_ms as i64,
+        );
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
@@ -197,10 +227,17 @@ impl AppServices {
             worker_task_manager: worker_task_manager.clone(),
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
+            agent_run_scheduler: agent_run_scheduler.clone(),
+            model_route_resolver: model_route_resolver.clone(),
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
         });
+
+        let restored_runs = conversation_service.recover_queued_agent_runs().await?;
+        if restored_runs > 0 {
+            tracing::info!(restored_runs, "restored queued agent runs after restart");
+        }
 
         Ok(Self {
             database,
@@ -214,6 +251,9 @@ impl AppServices {
             active_lease_registry,
             conversation_runtime_state,
             conversation_service,
+            agent_run_scheduler,
+            model_route_service,
+            model_route_resolver,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -241,6 +281,8 @@ struct ConversationServiceDeps<'a> {
     worker_task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
+    agent_run_scheduler: Arc<AgentRunScheduler>,
+    model_route_resolver: Arc<dyn ConversationModelRouteResolver>,
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
     runtime_helper_bin: String,
     runtime_base_url: String,
@@ -261,6 +303,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
     .with_runtime_state(deps.conversation_runtime_state)
+    .with_run_scheduler(deps.agent_run_scheduler)
+    .with_model_route_resolver(deps.model_route_resolver)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(

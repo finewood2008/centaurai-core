@@ -16,12 +16,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use aionui_common::encrypt_string;
 use aionui_db::{
     CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
-    SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
+    SqliteModelRouteRepository, SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
 };
 use aionui_realtime::BroadcastEventBus;
 use aionui_system::{
-    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
-    RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ModelRouteService, ProtocolDetectionService,
+    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,7 +37,11 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
         provider_service: ProviderService::new(provider_repo.clone(), TEST_KEY),
-        model_fetch_service: ModelFetchService::new(provider_repo, TEST_KEY, http_client.clone()),
+        model_fetch_service: ModelFetchService::new(provider_repo.clone(), TEST_KEY, http_client.clone()),
+        model_route_service: ModelRouteService::new(
+            Arc::new(SqliteModelRouteRepository::new(db.pool().clone())),
+            provider_repo,
+        ),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, "0.1.0".to_owned()),
         runtime_prepare_service: RuntimePrepareService::new(Arc::new(BroadcastEventBus::new(16))),
@@ -50,7 +54,14 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
 async fn setup() -> (axum::Router, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let state = build_state(&db);
-    (system_routes(state), db)
+    (
+        system_routes(state).layer(axum::Extension(aionui_auth::CurrentUser {
+            id: "system_default_user".into(),
+            username: "admin".into(),
+            is_admin: true,
+        })),
+        db,
+    )
 }
 
 async fn create_provider(db: &aionui_db::Database, platform: &str, base_url: &str, api_key: &str) -> String {

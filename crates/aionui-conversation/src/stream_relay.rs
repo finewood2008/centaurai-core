@@ -15,7 +15,7 @@ use crate::stream_persistence::{
     PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
 };
 use aionui_db::IConversationRepository;
-use aionui_realtime::EventBroadcaster;
+use aionui_realtime::{EventBroadcaster, UserEventBroadcaster};
 use serde_json::json;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
@@ -118,6 +118,7 @@ impl StreamRelay {
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
         let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(UserEventBroadcaster::new(broadcaster, user_id.clone()));
         Self {
             conversation_id,
             msg_id,

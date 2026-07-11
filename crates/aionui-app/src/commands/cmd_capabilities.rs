@@ -64,7 +64,7 @@ fn data() -> Value {
             {
                 "name": "config",
                 "mode": "read-write",
-                "description": "Manage AionUi configuration: assistants, assistant rules, skills, MCP servers, providers, settings, agents, and scheduled tasks.",
+                "description": "Manage CentaurAI configuration: assistants, assistant rules, skills, MCP servers, providers, settings, agents, and scheduled tasks.",
                 "contract": "agent-facing-config-cli",
                 "contract_command": "config capabilities",
                 "invocation": "centaurai-core config capabilities",
@@ -78,7 +78,7 @@ fn data() -> Value {
             {
                 "name": "diagnose",
                 "mode": "read-only",
-                "description": "Diagnose a running AionUi installation: backend health, conversations, provider health, MCP, cron, teams, logs, and controlled GET reads.",
+                "description": "Diagnose a running CentaurAI installation: backend health, conversations, provider health, MCP, cron, teams, logs, and controlled GET reads.",
                 "contract": "agent-facing-diagnose-cli",
                 "contract_command": "diagnose capabilities",
                 "invocation": "centaurai-core diagnose capabilities",

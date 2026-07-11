@@ -17,7 +17,7 @@ pub(super) async fn health_check() -> Json<HealthResponse> {
         status: "ok",
         service: "centaurai-core",
         version: env!("CARGO_PKG_VERSION"),
-        commit: env!("GIT_COMMIT"),
+        commit: env!("CENTAURAI_CORE_COMMIT"),
         build_time: env!("BUILD_TIME"),
     })
 }

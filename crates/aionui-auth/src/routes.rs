@@ -134,6 +134,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
         local: false,
+        proxy_identity: None,
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -651,7 +652,7 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QR Login - AionUI</title>
+<title>QR Login - CentaurAI</title>
 <style>
   body { font-family: system-ui, sans-serif; display: flex; justify-content: center;
          align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
@@ -664,7 +665,7 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
 <div class="card">
-  <h1>AionUI</h1>
+  <h1>CentaurAI</h1>
   <p id="status" class="status">Processing login...</p>
 </div>
 <script>

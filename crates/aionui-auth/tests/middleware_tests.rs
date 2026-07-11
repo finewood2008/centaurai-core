@@ -135,6 +135,7 @@ fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepo
         jwt_service,
         user_repo,
         local: false,
+        proxy_identity: None,
     };
 
     Router::new()
@@ -410,6 +411,7 @@ async fn authenticated_action_limit_uses_user_id_key() {
                 request.extensions_mut().insert(CurrentUser {
                     id: "user_42".into(),
                     username: "admin".into(),
+                    is_admin: false,
                 });
                 Ok::<_, std::convert::Infallible>(next.run(request).await)
             },
