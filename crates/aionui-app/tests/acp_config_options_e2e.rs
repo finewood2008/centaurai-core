@@ -87,7 +87,7 @@ async fn runtime_ensure_requires_csrf() {
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/conversations/{id}/runtime/ensure"))
-        .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("centaurai-session={token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -171,7 +171,7 @@ async fn set_config_option_requires_csrf() {
         .method("PUT")
         .uri(format!("/api/conversations/{id}/config-options/model"))
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("centaurai-session={token}"))
         .body(Body::from(
             serde_json::to_vec(&json!({ "value": "mock-model-updated" })).unwrap(),
         ))

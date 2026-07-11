@@ -8,7 +8,7 @@ use aionui_common::decrypt_string;
 use aionui_db::IProviderRepository;
 
 use crate::error::SystemError;
-use crate::provider::deserialize_opt;
+use crate::provider::{deserialize_opt, validate_provider_base_url};
 
 /// Internal configuration extracted from a provider row for model fetching.
 #[derive(Debug)]
@@ -97,7 +97,7 @@ impl ModelFetchService {
             .ok_or_else(|| SystemError::NotFound(format!("Provider {provider_id} not found")))?;
 
         let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
-        if api_key.trim().is_empty() {
+        if api_key.trim().is_empty() && !is_local_platform(&row.platform) {
             return Err(SystemError::BadRequest("API key is empty".into()));
         }
 
@@ -121,11 +121,21 @@ fn validate_anonymous_request(req: &FetchModelsAnonymousRequest) -> Result<(), S
     if req.base_url.trim().is_empty() {
         return Err(SystemError::BadRequest("baseUrl is required".into()));
     }
-    // Bedrock uses bedrock_config for credentials; empty api_key is allowed there.
-    if req.platform != "bedrock" && req.api_key.trim().is_empty() {
+    validate_provider_base_url(&req.platform, &req.base_url)?;
+    // Bedrock uses bedrock_config and loopback model servers commonly have no
+    // bearer credential. Their platform id is explicit so a cloud endpoint
+    // cannot silently downgrade to an empty key.
+    if req.platform != "bedrock" && !is_local_platform(&req.platform) && req.api_key.trim().is_empty() {
         return Err(SystemError::BadRequest("apiKey is required".into()));
     }
     Ok(())
+}
+
+fn is_local_platform(platform: &str) -> bool {
+    matches!(
+        platform.trim().to_ascii_lowercase().as_str(),
+        "ollama" | "local" | "llama.cpp" | "llamacpp"
+    )
 }
 
 /// Platforms that support URL auto-fix (OpenAI-compatible).
@@ -207,6 +217,39 @@ mod tests {
         let id = create_provider(&db, "openai", "https://api.openai.com", "   ").await;
         let err = svc.load_provider_config(&id).await.unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn load_config_local_provider_allows_empty_api_key() {
+        let (svc, db) = setup().await;
+        let id = create_provider(&db, "ollama", "http://127.0.0.1:11434/v1", "").await;
+        let config = svc.load_provider_config(&id).await.unwrap();
+        assert_eq!(config.platform, "ollama");
+        assert!(config.api_key.is_empty());
+    }
+
+    #[test]
+    fn anonymous_local_provider_allows_empty_api_key() {
+        let request = FetchModelsAnonymousRequest {
+            platform: "ollama".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            api_key: String::new(),
+            bedrock_config: None,
+            try_fix: true,
+        };
+        assert!(validate_anonymous_request(&request).is_ok());
+    }
+
+    #[test]
+    fn anonymous_provider_blocks_metadata_endpoint() {
+        let request = FetchModelsAnonymousRequest {
+            platform: "openai".into(),
+            base_url: "http://169.254.169.254/latest/meta-data".into(),
+            api_key: "secret".into(),
+            bedrock_config: None,
+            try_fix: false,
+        };
+        assert!(validate_anonymous_request(&request).is_err());
     }
 
     #[tokio::test]

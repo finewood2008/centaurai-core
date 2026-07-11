@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use common::{body_json, build_app, get_request};
+use common::{body_json, build_app, get_request, setup_and_login};
 
 #[tokio::test]
 async fn auth_required_get_settings() {
@@ -27,7 +27,7 @@ async fn auth_required_patch_settings() {
         .body(Body::from(r#"{"language":"en-US"}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -49,7 +49,7 @@ async fn auth_required_put_client_prefs() {
         .body(Body::from(r#"{"key":"value"}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn auth_required_post_providers() {
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -85,7 +85,7 @@ async fn auth_required_delete_provider() {
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -107,7 +107,7 @@ async fn auth_required_check_update() {
         .body(Body::from(r#"{}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -122,7 +122,7 @@ async fn auth_required_detect_protocol() {
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn auth_required_fetch_models() {
         .body(Body::from(r#"{}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -149,11 +149,13 @@ async fn auth_required_list_decisions() {
 
 #[tokio::test]
 async fn csrf_required_create_decision() {
-    let (app, _) = build_app().await;
+    let (mut app, services) = build_app().await;
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let req = Request::builder()
         .method("POST")
         .uri("/api/decisions")
         .header("content-type", "application/json")
+        .header("cookie", format!("centaurai-session={token}"))
         .body(Body::from(r#"{"question":"Should we ship?","brain_count":3}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

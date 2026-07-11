@@ -22,11 +22,11 @@ fn empty_post_with_token(uri: &str, token: &str, csrf: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn empty_post_with_auth_without_csrf(uri: &str, token: &str) -> Request<Body> {
+fn empty_post_with_cookie_without_csrf(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("centaurai-session={token}"))
         .body(Body::empty())
         .unwrap()
 }
@@ -136,7 +136,7 @@ async fn conversation_active_lease_rejects_missing_csrf() {
     let conversation_id = create_conversation(&mut app, &token, &csrf).await;
 
     let resp = app
-        .oneshot(empty_post_with_auth_without_csrf(
+        .oneshot(empty_post_with_cookie_without_csrf(
             &format!("/api/conversations/{conversation_id}/active-lease"),
             &token,
         ))
@@ -238,7 +238,7 @@ async fn team_active_lease_rejects_missing_csrf() {
     insert_team(&services, &owner.id, "team-csrf", vec![]).await;
 
     let resp = app
-        .oneshot(empty_post_with_auth_without_csrf(
+        .oneshot(empty_post_with_cookie_without_csrf(
             "/api/teams/team-csrf/active-lease",
             &token,
         ))

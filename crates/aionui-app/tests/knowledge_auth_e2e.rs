@@ -32,5 +32,6 @@ async fn all_public_knowledge_route_groups_require_authentication() {
         .body(Body::from(r#"{"query":"private plan"}"#))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "UNAUTHORIZED");
 }

@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use aionui_api_types::ModelInfo;
+use futures_util::StreamExt;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use tracing::warn;
 
 use crate::error::SystemError;
@@ -9,6 +11,7 @@ use crate::error::SystemError;
 use super::FetchConfig;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MODELS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Dispatch to the appropriate platform-specific fetcher.
 pub(crate) async fn fetch_for_platform(
@@ -59,10 +62,7 @@ pub(super) async fn fetch_openai_compatible(
 
     check_response_status(&resp)?;
 
-    let body: OpenAiModelsResponse = resp
-        .json()
-        .await
-        .map_err(|e| SystemError::BadGateway(format!("Failed to parse models response: {e}")))?;
+    let body: OpenAiModelsResponse = limited_json(resp).await?;
 
     Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
 }
@@ -104,10 +104,7 @@ async fn fetch_anthropic(
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: AnthropicModelsResponse = resp
-                .json()
-                .await
-                .map_err(|e| SystemError::BadGateway(format!("Failed to parse Anthropic response: {e}")))?;
+            let body: AnthropicModelsResponse = limited_json(resp).await?;
             Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
         }
         Ok(resp) => {
@@ -146,10 +143,7 @@ async fn fetch_gemini(client: &reqwest::Client, base_url: &str, api_key: &str) -
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: GeminiModelsResponse = resp
-                .json()
-                .await
-                .map_err(|e| SystemError::BadGateway(format!("Failed to parse Gemini response: {e}")))?;
+            let body: GeminiModelsResponse = limited_json(resp).await?;
             let models = body
                 .models
                 .into_iter()
@@ -168,8 +162,10 @@ async fn fetch_gemini(client: &reqwest::Client, base_url: &str, api_key: &str) -
             );
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
-        Err(e) => {
-            warn!(error = %e, "Gemini models API unreachable, using fallback list");
+        Err(_) => {
+            // The Gemini credential is carried in the URL query, so never
+            // format the reqwest error (which may include that URL) into logs.
+            warn!("Gemini models API unreachable, using fallback list");
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
     }
@@ -319,6 +315,29 @@ async fn fetch_dashscope_coding(
 
 fn fallback_models(ids: &[&str]) -> Vec<ModelInfo> {
     ids.iter().map(|id| ModelInfo::Id((*id).to_string())).collect()
+}
+
+async fn limited_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, SystemError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
+    {
+        return Err(SystemError::BadGateway(
+            "Provider model response exceeded the size limit".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| SystemError::BadGateway("Provider response stream failed".into()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+            return Err(SystemError::BadGateway(
+                "Provider model response exceeded the size limit".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| SystemError::BadGateway("Provider returned invalid JSON".into()))
 }
 
 fn check_response_status(resp: &reqwest::Response) -> Result<(), SystemError> {

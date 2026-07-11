@@ -145,8 +145,10 @@ async fn t8_1_bedrock_unauthenticated() {
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    // CSRF middleware returns 403 for POST without CSRF token
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Authentication rejects anonymous requests before CSRF validation.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]

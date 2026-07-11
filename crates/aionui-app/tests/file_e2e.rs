@@ -59,9 +59,10 @@ async fn fs_endpoints_require_auth() {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::FORBIDDEN,
-            "expected 403 for unauthenticated {uri}"
+            StatusCode::UNAUTHORIZED,
+            "expected 401 for unauthenticated {uri}"
         );
+        assert_eq!(body_json(resp).await["code"], "UNAUTHORIZED", "{uri}");
     }
 }
 

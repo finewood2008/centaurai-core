@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use aionui_api_types::{CreateProviderRequest, ProviderResponse, UpdateProviderRequest};
@@ -70,7 +71,21 @@ impl ProviderService {
 
     /// Update an existing provider. Only provided fields are changed.
     pub async fn update(&self, id: &str, req: UpdateProviderRequest) -> Result<ProviderResponse, SystemError> {
-        validate_update_request(&req)?;
+        let platform = if req.base_url.is_some() {
+            match req.platform.as_deref() {
+                Some(platform) => Some(platform.to_owned()),
+                None => Some(
+                    self.repo
+                        .find_by_id(id)
+                        .await?
+                        .ok_or_else(|| SystemError::NotFound(format!("Provider {id} not found")))?
+                        .platform,
+                ),
+            }
+        } else {
+            req.platform.clone()
+        };
+        validate_update_request(&req, platform.as_deref())?;
 
         let encrypted_key = req
             .api_key
@@ -247,11 +262,11 @@ fn validate_create_request(req: &CreateProviderRequest) -> Result<(), SystemErro
             ));
         }
         if !req.base_url.trim().is_empty() {
-            validate_base_url(&req.base_url)?;
+            validate_provider_base_url(&req.platform, &req.base_url)?;
         }
     } else {
-        validate_base_url(&req.base_url)?;
-        if req.api_key.trim().is_empty() {
+        validate_provider_base_url(&req.platform, &req.base_url)?;
+        if req.api_key.trim().is_empty() && !is_local_platform(&req.platform) {
             return Err(SystemError::BadRequest("apiKey is required".into()));
         }
     }
@@ -264,6 +279,13 @@ fn validate_create_request(req: &CreateProviderRequest) -> Result<(), SystemErro
         reject_masked_secret_write(secret, "bedrockConfig.secretAccessKey")?;
     }
     Ok(())
+}
+
+fn is_local_platform(platform: &str) -> bool {
+    matches!(
+        platform.trim().to_ascii_lowercase().as_str(),
+        "ollama" | "local" | "llama.cpp" | "llamacpp"
+    )
 }
 
 /// Validate a caller-supplied provider id.
@@ -290,7 +312,7 @@ fn validate_id(id: &str) -> Result<(), SystemError> {
     Ok(())
 }
 
-fn validate_update_request(req: &UpdateProviderRequest) -> Result<(), SystemError> {
+fn validate_update_request(req: &UpdateProviderRequest, platform: Option<&str>) -> Result<(), SystemError> {
     if let Some(api_key) = req.api_key.as_deref() {
         reject_masked_secret_write(api_key, "apiKey")?;
     }
@@ -314,7 +336,7 @@ fn validate_update_request(req: &UpdateProviderRequest) -> Result<(), SystemErro
     if let Some(ref url) = req.base_url
         && !url.trim().is_empty()
     {
-        validate_base_url(url)?;
+        validate_provider_base_url(platform.unwrap_or_default(), url)?;
     }
     Ok(())
 }
@@ -328,16 +350,96 @@ fn reject_masked_secret_write(value: &str, field: &str) -> Result<(), SystemErro
     Ok(())
 }
 
-fn validate_base_url(url: &str) -> Result<(), SystemError> {
+pub(crate) fn validate_provider_base_url(platform: &str, url: &str) -> Result<(), SystemError> {
+    let (parsed, host, ip) = parse_provider_endpoint(url)?;
+    let local_platform = is_local_platform(platform);
+    let loopback = host == "localhost" || ip.is_some_and(|address| address.is_loopback());
+    if local_platform && !loopback {
+        return Err(SystemError::BadRequest(
+            "local provider baseUrl must use loopback".into(),
+        ));
+    }
+    if !local_platform && loopback {
+        return Err(SystemError::BadRequest(
+            "loopback baseUrl requires an explicit local provider platform".into(),
+        ));
+    }
+    require_encrypted_public_transport(&parsed, &host, ip, loopback)
+}
+
+/// Validate a pre-save protocol probe. Loopback is allowed because detection
+/// is also used for local servers, but metadata/link-local targets and public
+/// cleartext endpoints remain forbidden.
+pub(crate) fn validate_provider_probe_base_url(url: &str) -> Result<(), SystemError> {
+    let (parsed, host, ip) = parse_provider_endpoint(url)?;
+    let loopback = host == "localhost" || ip.is_some_and(|address| address.is_loopback());
+    require_encrypted_public_transport(&parsed, &host, ip, loopback)
+}
+
+fn parse_provider_endpoint(url: &str) -> Result<(reqwest::Url, String, Option<IpAddr>), SystemError> {
     if url.trim().is_empty() {
         return Err(SystemError::BadRequest("baseUrl is required".into()));
     }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|_| SystemError::BadRequest("baseUrl must be a valid HTTP URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(SystemError::BadRequest(
-            "baseUrl must start with http:// or https://".into(),
+            "baseUrl violates the provider endpoint policy".into(),
+        ));
+    }
+
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let ip = host.parse::<IpAddr>().ok();
+    if ip.is_some_and(forbidden_ip) {
+        return Err(SystemError::BadRequest("baseUrl host is not allowed".into()));
+    }
+    Ok((parsed, host, ip))
+}
+
+fn require_encrypted_public_transport(
+    parsed: &reqwest::Url,
+    host: &str,
+    ip: Option<IpAddr>,
+    loopback: bool,
+) -> Result<(), SystemError> {
+    let private_transport = ip.is_some_and(private_provider_ip) || host.ends_with(".local") || loopback;
+    if parsed.scheme() == "http" && !private_transport {
+        return Err(SystemError::BadRequest(
+            "non-private provider baseUrl must use https".into(),
         ));
     }
     Ok(())
+}
+
+fn forbidden_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address == Ipv4Addr::BROADCAST
+        }
+        IpAddr::V6(address) => address.is_unspecified() || address.is_unicast_link_local() || address.is_multicast(),
+    }
+}
+
+fn private_provider_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_private() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            (segments[0] & 0xfe00) == 0xfc00 || address == Ipv6Addr::LOCALHOST
+        }
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +561,18 @@ mod tests {
     }
 
     #[test]
+    fn validate_create_local_provider_allows_empty_api_key() {
+        let req = CreateProviderRequest {
+            platform: "ollama".into(),
+            name: "Ollama".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            api_key: String::new(),
+            ..sample_create_request()
+        };
+        assert!(validate_create_request(&req).is_ok());
+    }
+
+    #[test]
     fn validate_create_valid() {
         assert!(validate_create_request(&sample_create_request()).is_ok());
     }
@@ -511,12 +625,12 @@ mod tests {
             name: Some("".into()),
             ..Default::default()
         };
-        assert!(validate_update_request(&req).is_err());
+        assert!(validate_update_request(&req, Some("openai")).is_err());
     }
 
     #[test]
     fn validate_update_empty_request_ok() {
-        assert!(validate_update_request(&UpdateProviderRequest::default()).is_ok());
+        assert!(validate_update_request(&UpdateProviderRequest::default(), None).is_ok());
     }
 
     #[test]
@@ -525,7 +639,7 @@ mod tests {
             base_url: Some("".into()),
             ..Default::default()
         };
-        assert!(validate_update_request(&req).is_ok());
+        assert!(validate_update_request(&req, Some("openai")).is_ok());
     }
 
     #[test]
@@ -534,22 +648,43 @@ mod tests {
             base_url: Some("not-a-url".into()),
             ..Default::default()
         };
-        assert!(validate_update_request(&req).is_err());
+        assert!(validate_update_request(&req, Some("openai")).is_err());
     }
 
     #[test]
     fn validate_base_url_http() {
-        assert!(validate_base_url("http://localhost:8080").is_ok());
+        assert!(validate_provider_base_url("ollama", "http://localhost:8080").is_ok());
+        assert!(validate_provider_base_url("new-api", "http://192.168.1.5:3000/v1").is_ok());
     }
 
     #[test]
     fn validate_base_url_https() {
-        assert!(validate_base_url("https://api.example.com").is_ok());
+        assert!(validate_provider_base_url("openai", "https://api.example.com").is_ok());
     }
 
     #[test]
     fn validate_base_url_ftp_rejected() {
-        assert!(validate_base_url("ftp://files.example.com").is_err());
+        assert!(validate_provider_base_url("openai", "ftp://files.example.com").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_credentials_fragments_and_cleartext_public_hosts() {
+        assert!(validate_provider_base_url("openai", "https://secret@example.com/v1").is_err());
+        assert!(validate_provider_base_url("openai", "https://example.com/v1#models").is_err());
+        assert!(validate_provider_base_url("openai", "http://example.com/v1").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_blocks_metadata_and_requires_explicit_local_platform() {
+        assert!(validate_provider_base_url("openai", "http://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_provider_base_url("openai", "http://127.0.0.1:11434/v1").is_err());
+        assert!(validate_provider_base_url("ollama", "https://api.example.com/v1").is_err());
+    }
+
+    #[test]
+    fn protocol_probe_allows_loopback_but_not_metadata() {
+        assert!(validate_provider_probe_base_url("http://127.0.0.1:3000/v1").is_ok());
+        assert!(validate_provider_probe_base_url("http://169.254.169.254/latest/meta-data").is_err());
     }
 
     // -- service integration tests --

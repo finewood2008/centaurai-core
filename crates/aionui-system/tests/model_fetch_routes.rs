@@ -462,7 +462,7 @@ async fn fetch_models_anonymous_returns_models_for_valid_input() {
     let req = post_request(
         "/api/providers/fetch-models",
         json!({
-            "platform": "openai",
+            "platform": "local",
             "base_url": mock_server.uri(),
             "api_key": "sk-anon"
         }),
@@ -491,7 +491,7 @@ async fn fetch_models_anonymous_multi_key_uses_first_key_in_authorization_header
     let req = post_request(
         "/api/providers/fetch-models",
         json!({
-            "platform": "openai",
+            "platform": "local",
             "base_url": mock_server.uri(),
             "api_key": "first-key\nsecond-key",
             "try_fix": false

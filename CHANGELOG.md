@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.0](https://github.com/finewood2008/centaurai-core/compare/v0.1.48...v0.2.0) (2026-07-12)
+
+### Features
+
+- Added a Core-owned Knowledge Gateway with managed Worker supervision,
+  authenticated search/spaces/sources/jobs APIs, structured message retrieval,
+  cloud-consent enforcement, and restart-safe evidence persistence.
+- Added first-class multi-Brain Decisions with server-side sessions, turns,
+  evidence, candidates, resolutions and action items; 3–7 provider models run
+  in parallel with retry, cross-provider fallback and partial-result recovery.
+- Added one-time `contextofme://` device pairing, hashed and revocable device
+  credentials, canonical Context cookies/CSRF, and realtime revocation.
+
+### Security
+
+- Provider credentials remain write-only, provider and protocol discovery
+  disable redirects and bound response sizes, metadata/link-local endpoints are
+  rejected, and external cleartext Provider URLs are refused.
+- Decision citations can only enter through the Knowledge Gateway. Client
+  evidence is retained as an owner note and cannot impersonate a source.
+
+### Compatibility
+
+- Existing service routes, database names, environment aliases and the legacy
+  listening handshake remain available inside the compatibility layer.
+- Database migrations `024` and `025` add devices and Decisions without
+  rewriting existing conversation or provider data.
+
 ## [0.1.48](https://github.com/finewood2008/centaurai-core/compare/v0.1.47...v0.1.48) (2026-07-12)
 
 ### Features

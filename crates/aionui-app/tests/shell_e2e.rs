@@ -692,7 +692,9 @@ async fn au1_shell_unauthenticated() {
         .body(Body::from(r#"{"file_path":"/tmp/test.txt"}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // AU-2: unauthenticated STT request rejected
@@ -713,7 +715,9 @@ async fn au2_stt_unauthenticated() {
         .body(Body::from(body))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 // M-145: mailto scheme URL positive test

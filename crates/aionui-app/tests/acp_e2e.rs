@@ -63,7 +63,7 @@ async fn management_refresh_enforces_auth_and_csrf_then_returns_rows() {
     let missing_csrf = Request::builder()
         .method("POST")
         .uri("/api/agents/management/refresh")
-        .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("centaurai-session={token}"))
         .body(Body::empty())
         .unwrap();
     let response = app.clone().oneshot(missing_csrf).await.unwrap();

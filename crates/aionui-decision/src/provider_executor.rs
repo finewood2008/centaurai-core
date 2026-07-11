@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use aionui_api_types::{BrainDefinition, BrainKind};
@@ -94,36 +95,49 @@ impl BrainExecutionPort for ProviderBrainRuntime {
 
         let provider = self.provider(&invocation.brain.provider_id).await?;
         let api_key = decrypt_string(&provider.api_key_encrypted, &self.encryption_key)
-            .map_err(|_| unavailable("provider credential could not be decrypted"))?
+            .map_err(|_| unavailable("provider credential could not be decrypted"))?;
+        let api_key = api_key
             .split([',', '\n'])
             .map(str::trim)
             .find(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| unavailable("provider has no usable credential"))?;
+            .map(str::to_owned);
+        if api_key.is_none() && !is_local_platform(&provider.platform) {
+            return Err(unavailable("provider has no usable credential"));
+        }
         let protocol = provider_protocol(&provider, &invocation.brain.model);
         let prompt = build_prompt(&invocation);
         let url = validated_provider_url(&provider, protocol == "anthropic")?;
 
         let request = if protocol == "anthropic" {
-            self.client
+            let request = self
+                .client
                 .post(url)
-                .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
                     "model": invocation.brain.model,
                     "max_tokens": 2048,
                     "system": invocation.role.instructions,
                     "messages": [{"role": "user", "content": prompt}],
-                }))
+                }));
+            if let Some(api_key) = api_key.as_deref() {
+                request.header("x-api-key", api_key)
+            } else {
+                request
+            }
         } else {
-            self.client.post(url).bearer_auth(&api_key).json(&json!({
+            let request = self.client.post(url).json(&json!({
                 "model": invocation.brain.model,
                 "messages": [
                     {"role": "system", "content": invocation.role.instructions},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.2
-            }))
+            }));
+            if let Some(api_key) = api_key.as_deref() {
+                request.bearer_auth(api_key)
+            } else {
+                request
+            }
         };
 
         let response = request.send().await.map_err(map_reqwest_error)?;
@@ -225,11 +239,43 @@ fn validated_provider_url(provider: &Provider, anthropic: bool) -> Result<reqwes
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(unavailable("provider URL violates the HTTP endpoint policy"));
     }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let address = host.parse::<IpAddr>().ok();
+    if address.is_some_and(forbidden_ip) {
+        return Err(unavailable("provider URL host is not allowed"));
+    }
+    let loopback = host == "localhost" || address.is_some_and(|address| address.is_loopback());
+    if is_local_platform(&provider.platform) && !loopback {
+        return Err(unavailable("local provider URL must use loopback"));
+    }
+    if !is_local_platform(&provider.platform) && loopback {
+        return Err(unavailable("loopback provider URL requires an explicit local platform"));
+    }
     Ok(url)
+}
+
+fn is_local_platform(platform: &str) -> bool {
+    matches!(
+        platform.trim().to_ascii_lowercase().as_str(),
+        "ollama" | "local" | "llama.cpp" | "llamacpp"
+    )
+}
+
+fn forbidden_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address == Ipv4Addr::BROADCAST
+        }
+        IpAddr::V6(address) => address.is_unspecified() || address.is_unicast_link_local() || address.is_multicast(),
+    }
 }
 
 async fn limited_json(response: reqwest::Response) -> Result<Value, BrainExecutionFailure> {
@@ -355,14 +401,18 @@ mod tests {
     }
 
     async fn runtime(base_url: String) -> (ProviderBrainRuntime, aionui_db::Database) {
+        runtime_with_key(base_url, "secret-test-key").await
+    }
+
+    async fn runtime_with_key(base_url: String, api_key: &str) -> (ProviderBrainRuntime, aionui_db::Database) {
         let database = init_database_memory().await.unwrap();
         let repository = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let key = [0x42; 32];
-        let encrypted = encrypt_string("secret-test-key", &key).unwrap();
+        let encrypted = encrypt_string(api_key, &key).unwrap();
         repository
             .create(CreateProviderParams {
                 id: Some("provider-1"),
-                platform: "custom",
+                platform: "local",
                 name: "Provider",
                 base_url: &base_url,
                 api_key_encrypted: &encrypted,
@@ -443,6 +493,27 @@ mod tests {
         let error = runtime.execute(invocation()).await.unwrap_err();
         assert_eq!(error.kind, BrainExecutionFailureKind::Unavailable);
         assert!(error.message.contains("size limit"));
+        server.verify().await;
+    }
+
+    #[test]
+    fn metadata_endpoint_is_rejected() {
+        assert!(validated_provider_url(&provider("http://169.254.169.254/latest/meta-data", true), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_provider_can_run_without_a_bearer_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "local opinion"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (runtime, _database) = runtime_with_key(format!("{}/local", server.uri()), "").await;
+        let opinion = runtime.execute(invocation()).await.unwrap();
+        assert_eq!(opinion.content, "local opinion");
         server.verify().await;
     }
 }

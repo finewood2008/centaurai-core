@@ -39,7 +39,7 @@ async fn provider_health_check_requires_csrf_for_post() {
         .method("POST")
         .uri("/api/agents/provider-health-check")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("centaurai-session={token}"))
         .body(Body::from(
             serde_json::to_vec(&json!({"provider_id": "p1", "model": "gpt-4o"})).unwrap(),
         ))

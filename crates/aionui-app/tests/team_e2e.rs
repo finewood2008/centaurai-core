@@ -1282,7 +1282,7 @@ async fn sm1d_team_send_rejects_missing_csrf() {
     let req = axum::http::Request::builder()
         .method("POST")
         .uri(format!("/api/teams/{team_id}/messages"))
-        .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("centaurai-session={token}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(r#"{"content":"x"}"#))
         .unwrap();

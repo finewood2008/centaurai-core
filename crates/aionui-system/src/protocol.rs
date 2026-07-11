@@ -6,21 +6,26 @@ use aionui_api_types::{
     SuggestionType,
 };
 use aionui_common::ProtocolType;
+use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::debug;
 
 use crate::error::SystemError;
+use crate::provider::validate_provider_probe_base_url;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const MAX_TIMEOUT_MS: u64 = 60_000;
 const MAX_CONCURRENT_KEY_TESTS: usize = 5;
+const MAX_PROBE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Mask an API key for display in multi-key probe results: preserve the
 /// prefix up to the last dash before the secret part and the last 4
 /// characters, replacing the middle with `***`.
 ///
 /// Only used for diagnostic output of the protocol-detection endpoint;
-/// provider responses now return plaintext keys.
+/// provider responses and logs never return plaintext keys.
 fn mask_api_key(key: &str) -> String {
     if key.is_empty() {
         return "***".to_string();
@@ -221,10 +226,7 @@ impl ProtocolDetectionService {
 
             match resp {
                 Ok(r) if r.status().is_success() => {
-                    let body: DataResponse = r
-                        .json()
-                        .await
-                        .map_err(|e| SystemError::BadGateway(format!("Parse failed: {e}")))?;
+                    let body: DataResponse = limited_json(r).await?;
                     let confidence = if fixed.is_some() { 80 } else { 90 };
                     return Ok(ProbeOutcome::Success {
                         models: body.data.into_iter().map(|m| m.id).collect(),
@@ -256,13 +258,10 @@ impl ProtocolDetectionService {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| SystemError::BadGateway(format!("Anthropic probe failed: {e}")))?;
+            .map_err(|_| SystemError::BadGateway("Anthropic probe failed".into()))?;
 
         if resp.status().is_success() {
-            let body: DataResponse = resp
-                .json()
-                .await
-                .map_err(|e| SystemError::BadGateway(format!("Parse failed: {e}")))?;
+            let body: DataResponse = limited_json(resp).await?;
             return Ok(ProbeOutcome::Success {
                 models: body.data.into_iter().map(|m| m.id).collect(),
                 fixed_base_url: None,
@@ -285,13 +284,10 @@ impl ProtocolDetectionService {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| SystemError::BadGateway(format!("Gemini probe failed: {e}")))?;
+            .map_err(|_| SystemError::BadGateway("Gemini probe failed".into()))?;
 
         if resp.status().is_success() {
-            let body: GeminiResponse = resp
-                .json()
-                .await
-                .map_err(|e| SystemError::BadGateway(format!("Parse failed: {e}")))?;
+            let body: GeminiResponse = limited_json(resp).await?;
             let models = body
                 .models
                 .into_iter()
@@ -374,6 +370,15 @@ fn validate_request(req: &DetectProtocolRequest) -> Result<(), SystemError> {
     }
     if req.api_key.trim().is_empty() {
         return Err(SystemError::BadRequest("apiKey is required".into()));
+    }
+    validate_provider_probe_base_url(&req.base_url)?;
+    if req
+        .timeout
+        .is_some_and(|timeout| timeout == 0 || timeout > MAX_TIMEOUT_MS)
+    {
+        return Err(SystemError::BadRequest(format!(
+            "timeout must be between 1 and {MAX_TIMEOUT_MS} milliseconds"
+        )));
     }
     Ok(())
 }
@@ -507,13 +512,36 @@ async fn test_single_key(
     let resp = req
         .send()
         .await
-        .map_err(|e| SystemError::BadGateway(format!("Request failed: {e}")))?;
+        .map_err(|_| SystemError::BadGateway("Request failed".into()))?;
 
     if resp.status().is_success() {
         Ok(())
     } else {
         Err(SystemError::BadGateway(format!("Status: {}", resp.status())))
     }
+}
+
+async fn limited_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, SystemError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROBE_RESPONSE_BYTES as u64)
+    {
+        return Err(SystemError::BadGateway(
+            "Protocol probe response exceeded the size limit".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| SystemError::BadGateway("Protocol probe response failed".into()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROBE_RESPONSE_BYTES {
+            return Err(SystemError::BadGateway(
+                "Protocol probe response exceeded the size limit".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| SystemError::BadGateway("Protocol probe returned invalid JSON".into()))
 }
 
 #[cfg(test)]
@@ -709,6 +737,27 @@ mod tests {
             preferred_protocol: None,
         };
         assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_metadata_endpoint_and_unbounded_timeout() {
+        let metadata = DetectProtocolRequest {
+            base_url: "http://169.254.169.254/latest/meta-data".into(),
+            api_key: "sk-test".into(),
+            timeout: None,
+            test_all_keys: false,
+            preferred_protocol: None,
+        };
+        assert!(validate_request(&metadata).is_err());
+
+        let unbounded = DetectProtocolRequest {
+            base_url: "https://api.example.com".into(),
+            api_key: "sk-test".into(),
+            timeout: Some(MAX_TIMEOUT_MS + 1),
+            test_all_keys: false,
+            preferred_protocol: None,
+        };
+        assert!(validate_request(&unbounded).is_err());
     }
 
     // -- suggestion helpers --

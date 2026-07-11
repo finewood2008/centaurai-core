@@ -164,7 +164,7 @@ async fn model_fetch_openai_with_auth() {
         "POST",
         "/api/providers",
         json!({
-            "platform": "openai",
+            "platform": "local",
             "name": "OpenAI Mock",
             "base_url": mock_server.uri(),
             "api_key": "test-api-key"

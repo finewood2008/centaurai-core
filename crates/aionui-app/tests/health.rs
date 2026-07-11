@@ -87,16 +87,16 @@ async fn health_check_returns_ok_when_agent_metadata_cache_field_has_invalid_utf
 }
 
 #[tokio::test]
-async fn health_check_post_blocked_by_csrf() {
+async fn health_check_post_returns_method_not_allowed() {
     let app = build_app().await;
 
-    // POST without CSRF token is rejected by the global CSRF middleware
+    // /health is a public GET-only route, so POST is rejected by routing.
     let response = app
         .oneshot(build_request("POST", "/health"))
         .await
         .expect("request failed");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
