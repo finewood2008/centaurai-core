@@ -48,9 +48,8 @@ pub fn start_idle_scanner_with_coordinator(
     idle_cleanup_coordinator: Option<Arc<dyn IdleCleanupCoordinator>>,
 ) -> tokio::task::JoinHandle<()> {
     let configured_threshold_ms = idle_timeout_secs.map(|seconds| seconds * 1000);
-    let initial_threshold_ms = configured_threshold_ms
-        .map(|value| value as i64)
-        .unwrap_or_else(|| worker_task_manager.resident_idle_timeout_ms());
+    let initial_threshold_ms =
+        configured_threshold_ms.unwrap_or_else(|| worker_task_manager.resident_idle_timeout_ms());
     let scan_interval = scan_interval_secs.unwrap_or(SCAN_INTERVAL_SECS);
     info!(
         threshold_secs = initial_threshold_ms / 1000,
@@ -65,7 +64,6 @@ pub fn start_idle_scanner_with_coordinator(
             tokio::select! {
                 _ = interval.tick() => {
                     let threshold_ms = configured_threshold_ms
-                        .map(|value| value as i64)
                         .unwrap_or_else(|| worker_task_manager.resident_idle_timeout_ms());
                     scan_and_cleanup(
                         &worker_task_manager,
