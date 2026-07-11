@@ -317,7 +317,17 @@ async fn send_msg(
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    if req.knowledge.is_some() {
+        // Authorize the conversation before doing potentially expensive
+        // retrieval, and before exposing whether any knowledge exists.
+        state.service.get(&user.id, &id).await.map_err(ApiError::from)?;
+        state
+            .knowledge_gateway
+            .enrich_message(&user.id, &id, &mut req)
+            .await
+            .map_err(ApiError::from)?;
+    }
     let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)

@@ -42,7 +42,7 @@ and aionui-common has zero internal dependencies.
 
 ## Crate Hierarchy
 
-The project is organized as a Cargo workspace with 20 crates across four layers:
+The project is organized as a Cargo workspace with domain-focused crates across four layers:
 
 ### Foundation
 
@@ -72,6 +72,7 @@ Each crate owns an independent business domain. They remain loosely coupled from
 | Crate | Responsibility |
 |-------|----------------|
 | `aionui-conversation` | Conversation management, messaging, confirmations, streaming responses |
+| `aionui-knowledge` | Authenticated gateway to the private knowledge worker, retrieval policy, and citation validation |
 | `aionui-channel` | Multi-channel integration (WeChat, DingTalk, Lark), plugin system, pairing sessions |
 | `aionui-team` | Team collaboration, task scheduling, mailbox system |
 | `aionui-cron` | Scheduled job execution, cron expressions, event triggering |

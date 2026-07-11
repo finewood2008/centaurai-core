@@ -405,6 +405,7 @@ dependencies = [
  "aionui-db",
  "aionui-extension",
  "aionui-file",
+ "aionui-knowledge",
  "aionui-mcp",
  "aionui-office",
  "aionui-realtime",
@@ -571,6 +572,7 @@ dependencies = [
  "aionui-common",
  "aionui-db",
  "aionui-extension",
+ "aionui-knowledge",
  "aionui-mcp",
  "aionui-realtime",
  "aionui-runtime",
@@ -689,6 +691,28 @@ dependencies = [
  "tracing",
  "walkdir",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "aionui-knowledge"
+version = "0.1.48"
+dependencies = [
+ "aionui-api-types",
+ "aionui-common",
+ "aionui-runtime",
+ "async-trait",
+ "axum",
+ "futures-util",
+ "http-body-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
