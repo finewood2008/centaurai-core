@@ -5,7 +5,8 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -42,6 +43,36 @@ async fn legacy_refresh_agents_endpoint_is_not_found() {
     let req = json_with_token("POST", "/api/agents/refresh", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn management_refresh_enforces_auth_and_csrf_then_returns_rows() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+
+    let unauthenticated = Request::builder()
+        .method("POST")
+        .uri("/api/agents/management/refresh")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(unauthenticated).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_csrf = Request::builder()
+        .method("POST")
+        .uri("/api/agents/management/refresh")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(missing_csrf).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let request = json_with_token("POST", "/api/agents/management/refresh", json!({}), &token, &csrf);
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_json(response).await["data"].is_array());
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ fn main() -> ExitCode {
 
 fn run_main() -> Result<ExitCode, MainError> {
     let cli = Cli::parse();
+    let applied_env_aliases = bootstrap::apply_centaurai_core_env_aliases();
 
     // mcp-* subcommands route into short-lived stdio helpers that live entirely
     // outside the main HTTP server. They share the global flags so clap can
@@ -53,7 +54,7 @@ fn run_main() -> Result<ExitCode, MainError> {
         .enable_all()
         .build()
         .map_err(|error| runtime_init_error_for_command(&cli.command, error))?;
-    runtime.block_on(async_main(merged_path, cli))
+    runtime.block_on(async_main(merged_path, cli, applied_env_aliases))
 }
 
 fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Error) -> MainError {
@@ -75,7 +76,7 @@ fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Err
     ))
 }
 
-async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError> {
+async fn async_main(merged_path: String, cli: Cli, applied_env_aliases: usize) -> Result<ExitCode, MainError> {
     // MCP stdio helpers must not touch the database, logging setup, or `AppServices`.
     match cli.command {
         Some(Command::Capabilities) => Ok(commands::run_capabilities()),
@@ -87,6 +88,10 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
+            tracing::info!(
+                applied_aliases = applied_env_aliases,
+                "startup: CentaurAI Core environment aliases applied"
+            );
             let listener = commands::bind_http_listener(&mut env.config).await?;
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {

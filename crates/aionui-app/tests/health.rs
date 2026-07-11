@@ -43,6 +43,25 @@ async fn health_check_returns_ok() {
 }
 
 #[tokio::test]
+async fn capabilities_are_public_and_match_the_versioned_contract() {
+    let app = build_app().await;
+
+    let response = app
+        .oneshot(build_request("GET", "/api/capabilities"))
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("x-content-type-options").unwrap(), "nosniff");
+    let json = response_json(response.into_body()).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["contract"]["rest"], "1");
+    assert_eq!(json["data"]["contract"]["startup"], "2");
+    assert_eq!(json["data"]["features"]["agent_management_refresh"], true);
+    assert_eq!(json["data"]["websocket"]["version"], "1");
+}
+
+#[tokio::test]
 async fn health_check_returns_ok_when_agent_metadata_cache_field_has_invalid_utf8() {
     let db = aionui_db::init_database_memory().await.unwrap();
     sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")

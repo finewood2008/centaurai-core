@@ -5,6 +5,7 @@ use aionui_api_types::{CreateProviderRequest, ProviderResponse, UpdateProviderRe
 use aionui_common::{decrypt_string, encrypt_string};
 use aionui_db::{CreateProviderParams, IProviderRepository, UpdateProviderParams, models::Provider};
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 
 use crate::error::SystemError;
 
@@ -14,6 +15,8 @@ pub struct ProviderService {
     repo: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
 }
+
+const MASKED_SECRET_PREFIX: &str = "masked:v1:";
 
 impl ProviderService {
     pub fn new(repo: Arc<dyn IProviderRepository>, encryption_key: [u8; 32]) -> Self {
@@ -111,14 +114,13 @@ impl ProviderService {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Convert a DB row into a response DTO with the plaintext API key
-    /// (decrypted) and deserialized JSON fields.
-    ///
-    /// Pre-launch: the response returns the API key in plaintext so the
-    /// frontend can migrate its local store to the backend without losing
-    /// the key on re-read. Storage remains encrypted at rest.
+    /// Convert a DB row into a response DTO with non-secret credential
+    /// summaries and deserialized JSON fields.
     fn row_to_response(&self, row: Provider) -> Result<ProviderResponse, SystemError> {
         let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
+        let api_key_present = !api_key.trim().is_empty();
+        let api_key_mask = mask_secret_set(&api_key);
+        let key_id = api_key_present.then(|| provider_key_id(&row.api_key_encrypted));
 
         let models: Vec<String> = serde_json::from_str(&row.models)
             .map_err(|e| SystemError::Internal(format!("Failed to parse models JSON: {e}")))?;
@@ -128,14 +130,24 @@ impl ProviderService {
             deserialize_opt(&row.model_protocols, "model_protocols")?;
         let model_enabled: Option<HashMap<String, bool>> = deserialize_opt(&row.model_enabled, "model_enabled")?;
         let model_health = deserialize_opt(&row.model_health, "model_health")?;
-        let bedrock_config = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
+        let mut bedrock_config: Option<aionui_api_types::BedrockConfig> =
+            deserialize_opt(&row.bedrock_config, "bedrock_config")?;
+        if let Some(secret) = bedrock_config
+            .as_mut()
+            .and_then(|config| config.secret_access_key.as_mut())
+        {
+            *secret = mask_secret_set(secret);
+        }
 
         Ok(ProviderResponse {
             id: row.id,
             platform: row.platform,
             name: row.name,
             base_url: row.base_url,
-            api_key,
+            api_key: api_key_mask.clone(),
+            api_key_mask,
+            key_id,
+            api_key_present,
             models,
             enabled: row.enabled,
             capabilities,
@@ -149,6 +161,39 @@ impl ProviderService {
             updated_at: row.updated_at,
         })
     }
+}
+
+fn mask_secret_set(value: &str) -> String {
+    let keys: Vec<&str> = value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect();
+    let Some(first) = keys.first() else {
+        return String::new();
+    };
+    let chars: Vec<char> = first.chars().collect();
+    let visible = if chars.len() <= 8 {
+        "********".to_owned()
+    } else {
+        let prefix: String = chars.iter().take(4).collect();
+        let suffix: String = chars.iter().rev().take(4).rev().collect();
+        format!("{prefix}…{suffix}")
+    };
+    if keys.len() == 1 {
+        format!("{MASKED_SECRET_PREFIX}{visible}")
+    } else {
+        format!("{MASKED_SECRET_PREFIX}{visible} (+{} more)", keys.len() - 1)
+    }
+}
+
+fn provider_key_id(encrypted_value: &str) -> String {
+    let digest = Sha256::digest(encrypted_value.as_bytes());
+    format!("key_{}", hex::encode(&digest[..8]))
+}
+
+fn is_masked_secret(value: &str) -> bool {
+    value.trim().starts_with(MASKED_SECRET_PREFIX)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +255,14 @@ fn validate_create_request(req: &CreateProviderRequest) -> Result<(), SystemErro
             return Err(SystemError::BadRequest("apiKey is required".into()));
         }
     }
+    reject_masked_secret_write(&req.api_key, "apiKey")?;
+    if let Some(secret) = req
+        .bedrock_config
+        .as_ref()
+        .and_then(|config| config.secret_access_key.as_deref())
+    {
+        reject_masked_secret_write(secret, "bedrockConfig.secretAccessKey")?;
+    }
     Ok(())
 }
 
@@ -238,6 +291,16 @@ fn validate_id(id: &str) -> Result<(), SystemError> {
 }
 
 fn validate_update_request(req: &UpdateProviderRequest) -> Result<(), SystemError> {
+    if let Some(api_key) = req.api_key.as_deref() {
+        reject_masked_secret_write(api_key, "apiKey")?;
+    }
+    if let Some(secret) = req
+        .bedrock_config
+        .as_ref()
+        .and_then(|config| config.secret_access_key.as_deref())
+    {
+        reject_masked_secret_write(secret, "bedrockConfig.secretAccessKey")?;
+    }
     if let Some(ref platform) = req.platform
         && platform.trim().is_empty()
     {
@@ -252,6 +315,15 @@ fn validate_update_request(req: &UpdateProviderRequest) -> Result<(), SystemErro
         && !url.trim().is_empty()
     {
         validate_base_url(url)?;
+    }
+    Ok(())
+}
+
+fn reject_masked_secret_write(value: &str, field: &str) -> Result<(), SystemError> {
+    if is_masked_secret(value) {
+        return Err(SystemError::BadRequest(format!(
+            "{field} is a masked response value; omit it or provide a new plaintext secret"
+        )));
     }
     Ok(())
 }
@@ -392,6 +464,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_create_rejects_masked_api_key_placeholder() {
+        let req = CreateProviderRequest {
+            api_key: "masked:v1:sk-a…1234".into(),
+            ..sample_create_request()
+        };
+        let err = validate_create_request(&req).unwrap_err();
+        assert!(matches!(err, SystemError::BadRequest(message) if !message.contains("sk-a…1234")));
+    }
+
+    #[test]
     fn validate_create_bedrock_allows_empty_base_url_and_api_key() {
         let req = CreateProviderRequest {
             platform: "bedrock".into(),
@@ -488,15 +570,18 @@ mod tests {
         assert_eq!(created.platform, "anthropic");
         assert_eq!(created.name, "Anthropic");
         assert_eq!(created.base_url, "https://api.anthropic.com");
-        // API key is returned in plaintext (pre-launch; encrypted at rest).
-        assert_eq!(created.api_key, "sk-ant-api03-test1234");
+        assert_eq!(created.api_key, "masked:v1:sk-a…1234");
+        assert_eq!(created.api_key_mask, created.api_key);
+        assert!(created.api_key_present);
+        assert!(created.key_id.as_deref().is_some_and(|id| id.starts_with("key_")));
         assert_eq!(created.models, vec!["claude-sonnet-4-20250514"]);
         assert!(created.enabled);
 
         let all = svc.list().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, created.id);
-        assert_eq!(all[0].api_key, "sk-ant-api03-test1234");
+        assert_eq!(all[0].api_key, "masked:v1:sk-a…1234");
+        assert_eq!(all[0].key_id, created.key_id);
     }
 
     #[tokio::test]
@@ -565,17 +650,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_response_api_key_plaintext_matches_input() {
-        // Replaces the masking test: api_key on the response is the
-        // encrypted-then-decrypted plaintext (equal to the input).
+    async fn provider_response_masks_api_key_and_exposes_opaque_key_id() {
         let svc = setup().await;
         let req = CreateProviderRequest {
             api_key: "sk-secret-original-value".into(),
             ..sample_create_request()
         };
         let created = svc.create(req).await.unwrap();
-        assert_eq!(created.api_key, "sk-secret-original-value");
-        assert!(!created.api_key.contains("***"));
+        let encoded = serde_json::to_string(&created).unwrap();
+        assert_eq!(created.api_key, "masked:v1:sk-s…alue");
+        assert_eq!(created.api_key_mask, created.api_key);
+        assert!(created.key_id.as_deref().is_some_and(|id| id.starts_with("key_")));
+        assert!(!encoded.contains("sk-secret-original-value"));
     }
 
     #[tokio::test]
@@ -613,6 +699,7 @@ mod tests {
     async fn update_api_key_re_encrypts() {
         let svc = setup().await;
         let created = svc.create(sample_create_request()).await.unwrap();
+        let original_key_id = created.key_id.clone();
 
         let updated = svc
             .update(
@@ -625,8 +712,29 @@ mod tests {
             .await
             .unwrap();
 
-        // Response carries the new plaintext key (encrypted at rest).
-        assert_eq!(updated.api_key, "new-key-abcdefgh");
+        assert_eq!(updated.api_key, "masked:v1:new-…efgh");
+        assert_ne!(updated.key_id, original_key_id);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_masked_api_key_writeback_without_changing_secret() {
+        let svc = setup().await;
+        let created = svc.create(sample_create_request()).await.unwrap();
+
+        let err = svc
+            .update(
+                &created.id,
+                UpdateProviderRequest {
+                    api_key: Some(created.api_key_mask.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SystemError::BadRequest(message) if !message.contains(&created.api_key_mask)));
+        let listed = svc.list().await.unwrap();
+        assert_eq!(listed[0].key_id, created.key_id);
     }
 
     #[tokio::test]

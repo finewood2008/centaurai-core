@@ -449,7 +449,7 @@ async fn config_capabilities_prints_agent_readable_contract_without_runtime_env(
     assert_eq!(stdout["data"]["input"]["default_mode"], "stdin_json");
     assert_eq!(
         stdout["data"]["input"]["selectors"]["assistant_id"]["current"],
-        "resolve via AIONUI_CONVERSATION_ID"
+        "resolve via CENTAURAI_CORE_CONVERSATION_ID"
     );
 
     let domains = stdout["data"]["domains"]
@@ -1006,7 +1006,7 @@ async fn config_context_fails_with_stable_error_when_conversation_env_missing() 
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(
-        "CONFIG_ENV_MISSING command=\"config context\" field=\"AIONUI_CONVERSATION_ID\": missing required environment variable"
+        "CONFIG_ENV_MISSING command=\"config context\" field=\"CENTAURAI_CORE_CONVERSATION_ID\": missing required environment variable"
     ));
 }
 

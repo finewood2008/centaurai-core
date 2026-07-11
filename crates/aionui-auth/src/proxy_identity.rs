@@ -5,11 +5,29 @@ use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-const USER_HEADER: &str = "x-aionui-proxy-user-id";
-const USERNAME_HEADER: &str = "x-aionui-proxy-username";
-const ROLE_HEADER: &str = "x-aionui-proxy-role";
-const TIMESTAMP_HEADER: &str = "x-aionui-proxy-timestamp";
-const SIGNATURE_HEADER: &str = "x-aionui-proxy-signature";
+#[derive(Clone, Copy)]
+struct ProxyHeaderNames {
+    user: &'static str,
+    username: &'static str,
+    role: &'static str,
+    timestamp: &'static str,
+    signature: &'static str,
+}
+
+const CENTAURAI_HEADERS: ProxyHeaderNames = ProxyHeaderNames {
+    user: "x-centaurai-proxy-user-id",
+    username: "x-centaurai-proxy-username",
+    role: "x-centaurai-proxy-role",
+    timestamp: "x-centaurai-proxy-timestamp",
+    signature: "x-centaurai-proxy-signature",
+};
+const LEGACY_HEADERS: ProxyHeaderNames = ProxyHeaderNames {
+    user: "x-aionui-proxy-user-id",
+    username: "x-aionui-proxy-username",
+    role: "x-aionui-proxy-role",
+    timestamp: "x-aionui-proxy-timestamp",
+    signature: "x-aionui-proxy-signature",
+};
 const SIGNATURE_VERSION: &str = "v1";
 const MAX_CLOCK_SKEW_SECS: i64 = 60;
 
@@ -42,29 +60,29 @@ impl ProxyIdentityVerifier {
     }
 
     pub fn from_env() -> Option<Self> {
-        std::env::var("AIONUI_TRUSTED_PROXY_SECRET")
+        std::env::var("CENTAURAI_CORE_TRUSTED_PROXY_SECRET")
+            .or_else(|_| std::env::var("AIONUI_TRUSTED_PROXY_SECRET"))
             .ok()
             .and_then(|secret| Self::new(secret.into_bytes()))
     }
 
     pub fn has_identity_headers(headers: &HeaderMap) -> bool {
-        [
-            USER_HEADER,
-            USERNAME_HEADER,
-            ROLE_HEADER,
-            TIMESTAMP_HEADER,
-            SIGNATURE_HEADER,
-        ]
-        .into_iter()
-        .any(|name| headers.contains_key(name))
+        header_family_present(headers, CENTAURAI_HEADERS) || header_family_present(headers, LEGACY_HEADERS)
     }
 
     pub fn verify(&self, headers: &HeaderMap) -> Result<ProxyIdentity, ProxyIdentityError> {
-        let user_id = header(headers, USER_HEADER)?;
-        let username = header(headers, USERNAME_HEADER)?;
-        let role = header(headers, ROLE_HEADER)?;
-        let timestamp_raw = header(headers, TIMESTAMP_HEADER)?;
-        let signature = header(headers, SIGNATURE_HEADER)?;
+        // A partial canonical family must fail closed instead of falling back
+        // to legacy headers supplied alongside it.
+        let names = if header_family_present(headers, CENTAURAI_HEADERS) {
+            CENTAURAI_HEADERS
+        } else {
+            LEGACY_HEADERS
+        };
+        let user_id = header(headers, names.user)?;
+        let username = header(headers, names.username)?;
+        let role = header(headers, names.role)?;
+        let timestamp_raw = header(headers, names.timestamp)?;
+        let signature = header(headers, names.signature)?;
         let timestamp = timestamp_raw
             .parse::<i64>()
             .map_err(|_| ProxyIdentityError::InvalidTimestamp)?;
@@ -94,6 +112,12 @@ impl ProxyIdentityVerifier {
     }
 }
 
+fn header_family_present(headers: &HeaderMap, names: ProxyHeaderNames) -> bool {
+    [names.user, names.username, names.role, names.timestamp, names.signature]
+        .into_iter()
+        .any(|name| headers.contains_key(name))
+}
+
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, ProxyIdentityError> {
     headers
         .get(name)
@@ -111,7 +135,7 @@ mod tests {
 
     use super::*;
 
-    fn signed_headers(secret: &[u8], timestamp: i64, user_id: &str) -> HeaderMap {
+    fn signed_headers(secret: &[u8], timestamp: i64, user_id: &str, names: ProxyHeaderNames) -> HeaderMap {
         let timestamp = timestamp.to_string();
         let canonical = canonical_identity(&timestamp, user_id, "alice", "user");
         let mut mac = HmacSha256::new_from_slice(secret).unwrap();
@@ -119,11 +143,11 @@ mod tests {
         let signature = hex::encode(mac.finalize().into_bytes());
         let mut headers = HeaderMap::new();
         for (name, value) in [
-            (USER_HEADER, user_id),
-            (USERNAME_HEADER, "alice"),
-            (ROLE_HEADER, "user"),
-            (TIMESTAMP_HEADER, &timestamp),
-            (SIGNATURE_HEADER, &signature),
+            (names.user, user_id),
+            (names.username, "alice"),
+            (names.role, "user"),
+            (names.timestamp, &timestamp),
+            (names.signature, &signature),
         ] {
             headers.insert(name, HeaderValue::from_str(value).unwrap());
         }
@@ -134,21 +158,44 @@ mod tests {
     fn accepts_current_signed_identity() {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         let verifier = ProxyIdentityVerifier::new(b"secret".to_vec()).unwrap();
-        let identity = verifier.verify(&signed_headers(b"secret", now, "user-1")).unwrap();
+        let identity = verifier
+            .verify(&signed_headers(b"secret", now, "user-1", CENTAURAI_HEADERS))
+            .unwrap();
         assert_eq!(identity.user_id, "user-1");
         assert_eq!(identity.role, "user");
+    }
+
+    #[test]
+    fn accepts_legacy_signed_identity_headers() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let verifier = ProxyIdentityVerifier::new(b"secret".to_vec()).unwrap();
+        let identity = verifier
+            .verify(&signed_headers(b"secret", now, "legacy-user", LEGACY_HEADERS))
+            .unwrap();
+        assert_eq!(identity.user_id, "legacy-user");
     }
 
     #[test]
     fn rejects_signature_tampering_and_stale_requests() {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         let verifier = ProxyIdentityVerifier::new(b"secret".to_vec()).unwrap();
-        let mut tampered = signed_headers(b"secret", now, "user-1");
-        tampered.insert(USER_HEADER, HeaderValue::from_static("user-2"));
+        let mut tampered = signed_headers(b"secret", now, "user-1", CENTAURAI_HEADERS);
+        tampered.insert(CENTAURAI_HEADERS.user, HeaderValue::from_static("user-2"));
         assert_eq!(verifier.verify(&tampered), Err(ProxyIdentityError::InvalidSignature));
         assert_eq!(
-            verifier.verify(&signed_headers(b"secret", now - 61, "user-1")),
+            verifier.verify(&signed_headers(b"secret", now - 61, "user-1", CENTAURAI_HEADERS)),
             Err(ProxyIdentityError::Expired)
         );
+    }
+
+    #[test]
+    fn partial_canonical_headers_do_not_fall_back_to_legacy_identity() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let verifier = ProxyIdentityVerifier::new(b"secret".to_vec()).unwrap();
+        let mut headers = signed_headers(b"secret", now, "legacy-user", LEGACY_HEADERS);
+        headers.insert(CENTAURAI_HEADERS.user, HeaderValue::from_static("injected-user"));
+
+        assert!(ProxyIdentityVerifier::has_identity_headers(&headers));
+        assert_eq!(verifier.verify(&headers), Err(ProxyIdentityError::Incomplete));
     }
 }

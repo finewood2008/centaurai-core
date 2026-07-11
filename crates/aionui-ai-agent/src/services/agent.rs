@@ -78,6 +78,16 @@ impl AgentService {
         Ok(self.availability.list_management_rows().await)
     }
 
+    /// Re-resolve every configured agent command against the current process
+    /// environment, then return the refreshed management projection.
+    pub async fn refresh_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
+        tracing::info!("agent management refresh started");
+        self.registry.refresh_availability().await;
+        let rows = self.availability.list_management_rows().await;
+        tracing::info!(agent_count = rows.len(), "agent management refresh completed");
+        Ok(rows)
+    }
+
     /// Backend → logo URL catalog for business surfaces.
     ///
     /// Business pages (guid, team, cron, conversation lists) must render

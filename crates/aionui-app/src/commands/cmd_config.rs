@@ -18,9 +18,12 @@ use crate::cli::{
 };
 use crate::commands::config_capabilities;
 
-const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
-const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
-const ENV_USER_ID: &str = "AIONUI_USER_ID";
+const ENV_BASE_URL: &str = "CENTAURAI_CORE_BASE_URL";
+const ENV_CONVERSATION_ID: &str = "CENTAURAI_CORE_CONVERSATION_ID";
+const ENV_USER_ID: &str = "CENTAURAI_CORE_USER_ID";
+const LEGACY_ENV_BASE_URL: &str = "AIONUI_BASE_URL";
+const LEGACY_ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
+const LEGACY_ENV_USER_ID: &str = "AIONUI_USER_ID";
 
 pub async fn run_config(args: ConfigArgs) -> ExitCode {
     match run(args).await {
@@ -1229,15 +1232,18 @@ struct ConfigEnv {
 impl ConfigEnv {
     fn from_env(command: &str) -> Result<Self, ConfigError> {
         Ok(Self {
-            base_url: required_env(command, ENV_BASE_URL)?.trim_end_matches('/').to_owned(),
-            conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
-            user_id: required_env(command, ENV_USER_ID)?,
+            base_url: required_env(command, ENV_BASE_URL, LEGACY_ENV_BASE_URL)?
+                .trim_end_matches('/')
+                .to_owned(),
+            conversation_id: required_env(command, ENV_CONVERSATION_ID, LEGACY_ENV_CONVERSATION_ID)?,
+            user_id: required_env(command, ENV_USER_ID, LEGACY_ENV_USER_ID)?,
         })
     }
 }
 
-fn required_env(command: &str, name: &'static str) -> Result<String, ConfigError> {
+fn required_env(command: &str, name: &'static str, legacy_name: &'static str) -> Result<String, ConfigError> {
     std::env::var(name)
+        .or_else(|_| std::env::var(legacy_name))
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
@@ -1774,7 +1780,7 @@ mod tests {
 
         assert_eq!(
             error.stderr_line(),
-            "CONFIG_ENV_MISSING command=\"config context\" field=\"AIONUI_CONVERSATION_ID\": missing required environment variable"
+            "CONFIG_ENV_MISSING command=\"config context\" field=\"CENTAURAI_CORE_CONVERSATION_ID\": missing required environment variable"
         );
     }
 

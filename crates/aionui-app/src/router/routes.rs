@@ -37,6 +37,7 @@ use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
 
+use super::capabilities::get_capabilities;
 use super::health::health_check;
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
@@ -231,6 +232,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let router = Router::new()
         .route("/health", get(health_check))
+        .route("/api/capabilities", get(get_capabilities))
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)
         .merge(conversation_authenticated)

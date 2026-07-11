@@ -14,10 +14,14 @@ use crate::cli::{
 };
 use crate::commands::diagnose_capabilities;
 
-const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
-const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
-const ENV_USER_ID: &str = "AIONUI_USER_ID";
-const ENV_LOG_DIR: &str = "AIONUI_LOG_DIR";
+const ENV_BASE_URL: &str = "CENTAURAI_CORE_BASE_URL";
+const ENV_CONVERSATION_ID: &str = "CENTAURAI_CORE_CONVERSATION_ID";
+const ENV_USER_ID: &str = "CENTAURAI_CORE_USER_ID";
+const ENV_LOG_DIR: &str = "CENTAURAI_CORE_LOG_DIR";
+const LEGACY_ENV_BASE_URL: &str = "AIONUI_BASE_URL";
+const LEGACY_ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
+const LEGACY_ENV_USER_ID: &str = "AIONUI_USER_ID";
+const LEGACY_ENV_LOG_DIR: &str = "AIONUI_LOG_DIR";
 const MAX_HTTP_OUTPUT_BYTES: usize = 200_000;
 const MAX_LOG_LINES: usize = 1000;
 const MAX_LOG_SEARCH_DEPTH: usize = 6;
@@ -61,7 +65,7 @@ fn run_context() -> Result<(), DiagnoseError> {
             "user_id": env.user_id,
             "conversation_id": env.conversation_id,
             "base_url": env.base_url,
-            "log_dir": std::env::var(ENV_LOG_DIR).ok().filter(|value| !value.trim().is_empty()),
+            "log_dir": optional_env(ENV_LOG_DIR, LEGACY_ENV_LOG_DIR),
         }),
         meta_from_map(Map::new()),
         command,
@@ -210,7 +214,7 @@ fn run_logs_tail() -> Result<(), DiagnoseError> {
     let mut selectors = SelectorMeta::default();
     resolve_optional_log_conversation_selector(command, &mut payload, &mut selectors)?;
     let log_dir = optional_string_field(&payload, "log_dir")
-        .or_else(|| std::env::var(ENV_LOG_DIR).ok())
+        .or_else(|| optional_env(ENV_LOG_DIR, LEGACY_ENV_LOG_DIR))
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -264,15 +268,18 @@ struct DiagnoseEnv {
 impl DiagnoseEnv {
     fn from_env(command: &str) -> Result<Self, DiagnoseError> {
         Ok(Self {
-            base_url: required_env(command, ENV_BASE_URL)?.trim_end_matches('/').to_owned(),
-            conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
-            user_id: required_env(command, ENV_USER_ID)?,
+            base_url: required_env(command, ENV_BASE_URL, LEGACY_ENV_BASE_URL)?
+                .trim_end_matches('/')
+                .to_owned(),
+            conversation_id: required_env(command, ENV_CONVERSATION_ID, LEGACY_ENV_CONVERSATION_ID)?,
+            user_id: required_env(command, ENV_USER_ID, LEGACY_ENV_USER_ID)?,
         })
     }
 }
 
-fn required_env(command: &str, name: &'static str) -> Result<String, DiagnoseError> {
+fn required_env(command: &str, name: &'static str, legacy_name: &'static str) -> Result<String, DiagnoseError> {
     std::env::var(name)
+        .or_else(|_| std::env::var(legacy_name))
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
@@ -284,6 +291,14 @@ fn required_env(command: &str, name: &'static str) -> Result<String, DiagnoseErr
             )
             .field("field", name)
         })
+}
+
+fn optional_env(name: &'static str, legacy_name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .or_else(|_| std::env::var(legacy_name))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 async fn request_json(
@@ -495,7 +510,7 @@ fn resolve_optional_log_conversation_selector(
         .and_then(Value::as_str)
         .is_some_and(|value| value == "current")
     {
-        let conversation_id = required_env(command, ENV_CONVERSATION_ID)?;
+        let conversation_id = required_env(command, ENV_CONVERSATION_ID, LEGACY_ENV_CONVERSATION_ID)?;
         payload
             .as_object_mut()
             .expect("payload object checked by reader")
@@ -1179,7 +1194,7 @@ mod tests {
 
         assert_eq!(
             error.stderr_line(),
-            "DIAGNOSE_ENV_MISSING command=\"diagnose context\" field=\"AIONUI_CONVERSATION_ID\": missing required environment variable"
+            "DIAGNOSE_ENV_MISSING command=\"diagnose context\" field=\"CENTAURAI_CORE_CONVERSATION_ID\": missing required environment variable"
         );
     }
 

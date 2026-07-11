@@ -12,6 +12,7 @@ mod channel;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod core_capabilities;
 mod cron;
 mod custom_agent;
 mod extension;
@@ -86,6 +87,7 @@ pub use conversation::{
     SendMessageRequest, SendMessageResponse, UpdateAgentRuntimePolicyRequest, UpdateConversationArtifactRequest,
     UpdateConversationRequest,
 };
+pub use core_capabilities::{CoreCapabilitiesResponse, CoreContractVersions, CoreWebSocketCapabilities};
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
     CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto, CronJobRemovedPayload,

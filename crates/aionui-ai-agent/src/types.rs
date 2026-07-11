@@ -52,9 +52,23 @@ impl BuildTaskOptions {
         self.context.runtime_env.retain(|(key, _)| {
             !matches!(
                 key.as_str(),
-                AIONUI_USER_ID_ENV | AIONUI_CONVERSATION_ID_ENV | AIONUI_HELPER_BIN_ENV | AIONUI_BASE_URL_ENV
+                CENTAURAI_CORE_USER_ID_ENV
+                    | CENTAURAI_CORE_CONVERSATION_ID_ENV
+                    | CENTAURAI_CORE_HELPER_BIN_ENV
+                    | CENTAURAI_CORE_BASE_URL_ENV
+                    | AIONUI_USER_ID_ENV
+                    | AIONUI_CONVERSATION_ID_ENV
+                    | AIONUI_HELPER_BIN_ENV
+                    | AIONUI_BASE_URL_ENV
             )
         });
+        self.context
+            .runtime_env
+            .push((CENTAURAI_CORE_USER_ID_ENV.to_owned(), user_id.to_owned()));
+        self.context.runtime_env.push((
+            CENTAURAI_CORE_CONVERSATION_ID_ENV.to_owned(),
+            conversation_id.to_owned(),
+        ));
         self.context
             .runtime_env
             .push((AIONUI_USER_ID_ENV.to_owned(), user_id.to_owned()));
@@ -64,9 +78,15 @@ impl BuildTaskOptions {
         if let Some(helper_bin) = helper_bin {
             self.context
                 .runtime_env
+                .push((CENTAURAI_CORE_HELPER_BIN_ENV.to_owned(), helper_bin.to_owned()));
+            self.context
+                .runtime_env
                 .push((AIONUI_HELPER_BIN_ENV.to_owned(), helper_bin.to_owned()));
         }
         if let Some(base_url) = base_url {
+            self.context
+                .runtime_env
+                .push((CENTAURAI_CORE_BASE_URL_ENV.to_owned(), base_url.to_owned()));
             self.context
                 .runtime_env
                 .push((AIONUI_BASE_URL_ENV.to_owned(), base_url.to_owned()));
@@ -75,11 +95,15 @@ impl BuildTaskOptions {
     }
 }
 
+pub const CENTAURAI_CORE_USER_ID_ENV: &str = "CENTAURAI_CORE_USER_ID";
+pub const CENTAURAI_CORE_CONVERSATION_ID_ENV: &str = "CENTAURAI_CORE_CONVERSATION_ID";
+pub const CENTAURAI_CORE_HELPER_BIN_ENV: &str = "CENTAURAI_CORE_HELPER_BIN";
+pub const CENTAURAI_CORE_BASE_URL_ENV: &str = "CENTAURAI_CORE_BASE_URL";
 pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
 pub const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
 pub const AIONUI_HELPER_BIN_ENV: &str = "AIONUI_HELPER_BIN";
 pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
-pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
+pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
@@ -217,6 +241,18 @@ mod tests {
             options
                 .context
                 .runtime_env
+                .contains(&(CENTAURAI_CORE_USER_ID_ENV.to_owned(), "user-1".to_owned()))
+        );
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(CENTAURAI_CORE_CONVERSATION_ID_ENV.to_owned(), "conv-1".to_owned()))
+        );
+        assert!(
+            options
+                .context
+                .runtime_env
                 .contains(&(AIONUI_USER_ID_ENV.to_owned(), "user-1".to_owned()))
         );
         assert!(
@@ -226,8 +262,16 @@ mod tests {
                 .contains(&(AIONUI_CONVERSATION_ID_ENV.to_owned(), "conv-1".to_owned()))
         );
         assert!(options.context.runtime_env.contains(&(
+            CENTAURAI_CORE_HELPER_BIN_ENV.to_owned(),
+            "/Applications/AionUi/aioncore".to_owned()
+        )));
+        assert!(options.context.runtime_env.contains(&(
             AIONUI_HELPER_BIN_ENV.to_owned(),
             "/Applications/AionUi/aioncore".to_owned()
+        )));
+        assert!(options.context.runtime_env.contains(&(
+            CENTAURAI_CORE_BASE_URL_ENV.to_owned(),
+            "http://127.0.0.1:25808".to_owned()
         )));
         assert!(
             options

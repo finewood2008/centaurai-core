@@ -257,15 +257,18 @@ async fn diagnose_capabilities_prints_agent_readable_contract_without_runtime_en
 }
 
 #[tokio::test]
-async fn diagnose_health_reads_backend_health_from_runtime_base_url() {
+async fn diagnose_health_accepts_canonical_centaurai_runtime_environment() {
     let capture = Arc::new(Mutex::new(Capture::default()));
     let (base_url, handle) = spawn_diagnose_probe_server(capture).await;
 
     let output = diagnose_command()
         .arg("health")
-        .env("AIONUI_BASE_URL", &base_url)
-        .env("AIONUI_CONVERSATION_ID", "conv-health")
-        .env("AIONUI_USER_ID", "user-health")
+        .env_remove("AIONUI_BASE_URL")
+        .env_remove("AIONUI_CONVERSATION_ID")
+        .env_remove("AIONUI_USER_ID")
+        .env("CENTAURAI_CORE_BASE_URL", &base_url)
+        .env("CENTAURAI_CORE_CONVERSATION_ID", "conv-health")
+        .env("CENTAURAI_CORE_USER_ID", "user-health")
         .output()
         .await
         .unwrap();

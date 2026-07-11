@@ -22,6 +22,8 @@ aws-config.workspace = true
 aws-sdk-bedrock.workspace = true
 semver.workspace = true
 dirs.workspace = true
+hex.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true }

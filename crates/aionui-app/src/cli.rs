@@ -28,7 +28,7 @@ pub(crate) struct Cli {
     pub parent_pid: Option<u32>,
 
     /// Working directory for conversation workspaces.
-    /// Falls back to AIONUI_WORK_DIR env, then to data-dir.
+    /// Falls back to CENTAURAI_CORE_WORK_DIR (or legacy AIONUI_WORK_DIR), then to data-dir.
     #[arg(long)]
     pub work_dir: Option<PathBuf>,
 

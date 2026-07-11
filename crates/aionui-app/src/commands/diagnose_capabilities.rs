@@ -2,7 +2,12 @@
 
 use serde_json::{Value, json};
 
-const RUNTIME_ENV: [&str; 3] = ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"];
+const RUNTIME_ENV: [&str; 3] = [
+    "CENTAURAI_CORE_BASE_URL",
+    "CENTAURAI_CORE_CONVERSATION_ID",
+    "CENTAURAI_CORE_USER_ID",
+];
+const LEGACY_RUNTIME_ENV: [&str; 3] = ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"];
 
 pub(crate) fn data() -> Value {
     json!({
@@ -14,7 +19,7 @@ pub(crate) fn data() -> Value {
             "business_flags": false,
             "selectors": {
                 "conversation_id": {
-                    "current": "resolve from AIONUI_CONVERSATION_ID",
+                    "current": "resolve from CENTAURAI_CORE_CONVERSATION_ID",
                     "literal": "treat as conversation id"
                 }
             }
@@ -31,9 +36,11 @@ pub(crate) fn data() -> Value {
             }
         },
         "runtime_context": {
-            "primary": "AIONUI_CONVERSATION_ID",
+            "primary": "CENTAURAI_CORE_CONVERSATION_ID",
             "environment": RUNTIME_ENV,
-            "optional_environment": ["AIONUI_LOG_DIR"]
+            "legacy_environment": LEGACY_RUNTIME_ENV,
+            "optional_environment": ["CENTAURAI_CORE_LOG_DIR"],
+            "legacy_optional_environment": ["AIONUI_LOG_DIR"]
         },
         "safety": {
             "read_only": true,
@@ -80,7 +87,7 @@ pub(crate) fn data() -> Value {
             domain("logs", &[
                 command(CommandDescriptor {
                     path: &["logs", "tail"],
-                    description: "Tail CentaurAI Core logs from AIONUI_LOG_DIR or stdin log_dir.",
+                    description: "Tail CentaurAI Core logs from CENTAURAI_CORE_LOG_DIR or stdin log_dir.",
                     input: "stdin_json",
                     stdin_fields: &["log_dir", "lines", "errors_only", "conversation_id"],
                     selectors: &["conversation_id"],

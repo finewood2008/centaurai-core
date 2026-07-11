@@ -126,7 +126,7 @@ async fn list_providers_empty() {
 }
 
 #[tokio::test]
-async fn list_providers_returns_plaintext_api_key() {
+async fn list_providers_returns_only_mask_and_key_id() {
     let (_app, db) = setup().await;
     create_one(&db).await;
 
@@ -139,9 +139,12 @@ async fn list_providers_returns_plaintext_api_key() {
     assert_eq!(providers.len(), 1);
 
     let api_key = providers[0]["api_key"].as_str().unwrap();
-    // Pre-launch: api_key is returned plaintext on the wire (encrypted at rest).
-    assert_eq!(api_key, "sk-ant-api03-test1234");
-    assert!(!api_key.contains("***"));
+    let encoded = serde_json::to_string(&json).unwrap();
+    assert_eq!(api_key, "masked:v1:sk-a…1234");
+    assert_eq!(providers[0]["api_key_mask"], api_key);
+    assert_eq!(providers[0]["api_key_present"], true);
+    assert!(providers[0]["key_id"].as_str().unwrap().starts_with("key_"));
+    assert!(!encoded.contains("sk-ant-api03-test1234"));
 }
 
 // ===========================================================================
@@ -165,7 +168,12 @@ async fn create_provider_success() {
     assert_eq!(data["platform"], "anthropic");
     assert_eq!(data["name"], "Anthropic");
     assert_eq!(data["base_url"], "https://api.anthropic.com");
-    assert_eq!(data["api_key"], "sk-ant-api03-test1234");
+    let encoded = serde_json::to_string(&json).unwrap();
+    assert_eq!(data["api_key"], "masked:v1:sk-a…1234");
+    assert_eq!(data["api_key_mask"], data["api_key"]);
+    assert_eq!(data["api_key_present"], true);
+    assert!(data["key_id"].as_str().unwrap().starts_with("key_"));
+    assert!(!encoded.contains("sk-ant-api03-test1234"));
     assert!(data["enabled"].as_bool().unwrap());
     assert!(data["models"].as_array().unwrap().is_empty());
     assert!(data["created_at"].as_i64().unwrap() > 0);
@@ -193,6 +201,9 @@ async fn non_admin_lists_only_enabled_logical_routes_without_physical_keys() {
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0]["id"], "route:fast");
     assert_eq!(providers[0]["api_key"], "");
+    assert_eq!(providers[0]["api_key_mask"], "");
+    assert_eq!(providers[0]["api_key_present"], false);
+    assert!(providers[0].get("key_id").is_none());
     assert_ne!(providers[0]["id"], physical_id);
 }
 
@@ -213,7 +224,8 @@ async fn create_provider_with_supplied_id() {
     let json = body_json(resp).await;
     let data = &json["data"];
     assert_eq!(data["id"], "caller-id-123");
-    assert_eq!(data["api_key"], "sk-test");
+    assert_eq!(data["api_key"], "masked:v1:********");
+    assert_eq!(data["api_key_mask"], data["api_key"]);
     assert_eq!(data["model_enabled"]["gpt-4"], true);
     assert_eq!(data["model_enabled"]["gpt-3.5"], false);
 }
@@ -274,7 +286,7 @@ async fn create_provider_with_optional_fields() {
             "auth_method": "accessKey",
             "region": "us-east-1",
             "access_key_id": "AKIA...",
-            "secret_access_key": "secret"
+            "secret_access_key": "bedrock-secret-value"
         }
     });
 
@@ -289,6 +301,34 @@ async fn create_provider_with_optional_fields() {
     assert_eq!(data["context_limit"], 200000);
     assert_eq!(data["bedrock_config"]["auth_method"], "accessKey");
     assert_eq!(data["bedrock_config"]["region"], "us-east-1");
+    assert_eq!(data["bedrock_config"]["secret_access_key"], "masked:v1:bedr…alue");
+    assert!(!serde_json::to_string(&json).unwrap().contains("bedrock-secret-value"));
+}
+
+#[tokio::test]
+async fn create_provider_rejects_masked_bedrock_secret_without_echoing_it() {
+    let (app, _db) = setup().await;
+    let placeholder = "masked:v1:bedr…alue";
+    let body = json!({
+        "platform": "bedrock",
+        "name": "AWS Bedrock",
+        "base_url": "",
+        "api_key": "",
+        "bedrock_config": {
+            "auth_method": "accessKey",
+            "region": "us-east-1",
+            "access_key_id": "AKIAEXAMPLE",
+            "secret_access_key": placeholder
+        }
+    });
+
+    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let encoded = serde_json::to_string(&body).unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(!encoded.contains(placeholder));
 }
 
 #[tokio::test]
@@ -378,7 +418,7 @@ async fn update_provider_name() {
 }
 
 #[tokio::test]
-async fn update_provider_api_key_returns_plaintext() {
+async fn update_provider_api_key_returns_new_mask_and_key_id() {
     let (_app, db) = setup().await;
     let (_, id) = create_one(&db).await;
 
@@ -395,7 +435,33 @@ async fn update_provider_api_key_returns_plaintext() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let api_key = json["data"]["api_key"].as_str().unwrap();
-    assert_eq!(api_key, "new-key-abcdefgh");
+    assert_eq!(api_key, "masked:v1:new-…efgh");
+    assert!(json["data"]["key_id"].as_str().unwrap().starts_with("key_"));
+    assert!(!serde_json::to_string(&json).unwrap().contains("new-key-abcdefgh"));
+}
+
+#[tokio::test]
+async fn update_provider_rejects_masked_api_key_writeback_without_echoing_it() {
+    let (_app, db) = setup().await;
+    let (created, id) = create_one(&db).await;
+    let mask = created["data"]["api_key_mask"].as_str().unwrap().to_owned();
+
+    let app2 = admin_app(&db);
+    let resp = app2
+        .oneshot(json_request(
+            "PUT",
+            &format!("/api/providers/{id}"),
+            json!({"api_key": mask}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let encoded = serde_json::to_string(&body).unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(!encoded.contains("sk-ant-api03-test1234"));
+    assert!(!encoded.contains("masked:v1:sk-a…1234"));
 }
 
 #[tokio::test]

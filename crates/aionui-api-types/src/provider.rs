@@ -117,17 +117,26 @@ pub struct BedrockConfig {
 
 /// Provider response for `GET /api/providers` and single-provider endpoints.
 ///
-/// The `api_key` field is returned in plaintext (decrypted on read). Storage
-/// remains encrypted at rest. Pre-launch convention for the frontend
-/// local-store → backend migration; no masking applied.
+/// Secret values are write-only on create/update requests. `api_key` remains
+/// as a compatibility alias for `api_key_mask`; neither field contains a
+/// usable credential. Clients must omit `api_key` on update unless the user
+/// explicitly supplies a new plaintext value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
     pub id: String,
     pub platform: String,
     pub name: String,
     pub base_url: String,
-    /// Plaintext API key (decrypted from storage).
+    /// Deprecated compatibility alias for `api_key_mask`.
     pub api_key: String,
+    /// Non-secret display value with the reserved `masked:v1:` prefix.
+    #[serde(default)]
+    pub api_key_mask: String,
+    /// Opaque identifier for the stored API-key version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub api_key_present: bool,
     pub models: Vec<String>,
     pub enabled: bool,
     pub capabilities: Vec<ModelCapability>,
@@ -459,7 +468,10 @@ mod tests {
             platform: "anthropic".into(),
             name: "Anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
-            api_key: "sk-ant-api03-plaintext".into(),
+            api_key: "masked:v1:sk-a…text".into(),
+            api_key_mask: "masked:v1:sk-a…text".into(),
+            key_id: Some("key_0123456789abcdef".into()),
+            api_key_present: true,
             models: vec!["claude-sonnet-4-20250514".into()],
             enabled: true,
             capabilities: vec![ModelCapability {
@@ -478,7 +490,10 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "uuid-xxx");
         assert_eq!(json["platform"], "anthropic");
-        assert_eq!(json["api_key"], "sk-ant-api03-plaintext");
+        assert_eq!(json["api_key"], "masked:v1:sk-a…text");
+        assert_eq!(json["api_key_mask"], "masked:v1:sk-a…text");
+        assert_eq!(json["key_id"], "key_0123456789abcdef");
+        assert_eq!(json["api_key_present"], true);
         assert_eq!(json["base_url"], "https://api.anthropic.com");
         assert_eq!(json["models"][0], "claude-sonnet-4-20250514");
         assert_eq!(json["model_enabled"]["claude-sonnet-4-20250514"], true);
@@ -488,14 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_response_api_key_plaintext() {
-        // Pre-launch: no masking is applied to the api_key field on the wire.
+    fn test_provider_response_never_serializes_plaintext_api_key() {
         let resp = ProviderResponse {
             id: "id".into(),
             platform: "openai".into(),
             name: "n".into(),
             base_url: "https://api.openai.com".into(),
-            api_key: "sk-secret-xyz".into(),
+            api_key: "masked:v1:sk-s…-xyz".into(),
+            api_key_mask: "masked:v1:sk-s…-xyz".into(),
+            key_id: Some("key_fedcba9876543210".into()),
+            api_key_present: true,
             models: vec![],
             enabled: true,
             capabilities: vec![],
@@ -509,8 +526,10 @@ mod tests {
             updated_at: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["api_key"], "sk-secret-xyz");
-        assert!(!json["api_key"].as_str().unwrap().contains("***"));
+        let encoded = serde_json::to_string(&json).unwrap();
+        assert_eq!(json["api_key"], "masked:v1:sk-s…-xyz");
+        assert_eq!(json["api_key_mask"], json["api_key"]);
+        assert!(!encoded.contains("sk-secret-xyz"));
     }
 
     // -- CreateProviderRequest --

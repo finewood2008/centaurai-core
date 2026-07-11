@@ -17,7 +17,8 @@ use aionui_team::TeamIdleCleanupCoordinator;
 
 use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, ServerEnvironment};
 
-const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
+const LISTENING_EVENT_PREFIX: &str = "CENTAURAI_CORE_LISTENING";
+const LEGACY_LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -186,17 +187,23 @@ fn is_fetch_forbidden_backend_port(port: u16) -> bool {
     )
 }
 
-fn format_listening_event(addr: SocketAddr) -> String {
+fn format_listening_event(prefix: &str, addr: SocketAddr) -> String {
     let payload = serde_json::json!({
         "host": addr.ip().to_string(),
         "port": addr.port(),
     });
-    format!("{LISTENING_EVENT_PREFIX} {payload}")
+    format!("{prefix} {payload}")
 }
 
 fn emit_listening_event(addr: SocketAddr) {
-    println!("{}", format_listening_event(addr));
+    println!("{}", format_listening_event(LISTENING_EVENT_PREFIX, addr));
+    println!("{}", format_listening_event(LEGACY_LISTENING_EVENT_PREFIX, addr));
     let _ = io::stdout().flush();
+    info!(
+        contract = LISTENING_EVENT_PREFIX,
+        legacy_contract = LEGACY_LISTENING_EVENT_PREFIX,
+        "startup: listening contracts emitted"
+    );
 }
 
 /// Start the HTTP server with fully constructed services.
@@ -420,17 +427,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn listening_event_line_is_machine_readable() {
+    fn listening_event_lines_are_machine_readable_in_compatibility_order() {
         let addr: SocketAddr = "127.0.0.1:49153".parse().unwrap();
 
-        let line = format_listening_event(addr);
+        let lines = [
+            format_listening_event(LISTENING_EVENT_PREFIX, addr),
+            format_listening_event(LEGACY_LISTENING_EVENT_PREFIX, addr),
+        ];
 
-        let payload = line
-            .strip_prefix("AIONCORE_LISTENING ")
-            .expect("line should start with the listening event prefix");
-        let parsed: serde_json::Value = serde_json::from_str(payload).expect("payload should be valid JSON");
-        assert_eq!(parsed["host"], "127.0.0.1");
-        assert_eq!(parsed["port"], 49153);
+        for (line, prefix) in lines
+            .iter()
+            .zip([LISTENING_EVENT_PREFIX, LEGACY_LISTENING_EVENT_PREFIX])
+        {
+            let payload = line
+                .strip_prefix(&format!("{prefix} "))
+                .expect("line should start with the expected listening event prefix");
+            let parsed: serde_json::Value = serde_json::from_str(payload).expect("payload should be valid JSON");
+            assert_eq!(parsed["host"], "127.0.0.1");
+            assert_eq!(parsed["port"], 49153);
+        }
+        assert!(lines[0].starts_with("CENTAURAI_CORE_LISTENING "));
+        assert!(lines[1].starts_with("AIONCORE_LISTENING "));
     }
 
     #[test]

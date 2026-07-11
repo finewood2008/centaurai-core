@@ -2,7 +2,12 @@
 
 use serde_json::{Value, json};
 
-const RUNTIME_ENV: [&str; 3] = ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"];
+const RUNTIME_ENV: [&str; 3] = [
+    "CENTAURAI_CORE_BASE_URL",
+    "CENTAURAI_CORE_CONVERSATION_ID",
+    "CENTAURAI_CORE_USER_ID",
+];
+const LEGACY_RUNTIME_ENV: [&str; 3] = ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"];
 
 pub(crate) fn data() -> Value {
     json!({
@@ -14,15 +19,15 @@ pub(crate) fn data() -> Value {
             "business_flags": false,
             "selectors": {
                 "assistant_id": {
-                    "current": "resolve via AIONUI_CONVERSATION_ID",
+                    "current": "resolve via CENTAURAI_CORE_CONVERSATION_ID",
                     "literal": "treat as assistant id"
                 },
                 "conversation_id": {
-                    "current": "resolve from AIONUI_CONVERSATION_ID",
+                    "current": "resolve from CENTAURAI_CORE_CONVERSATION_ID",
                     "literal": "treat as conversation id"
                 },
                 "user_id": {
-                    "current": "resolve from AIONUI_USER_ID",
+                    "current": "resolve from CENTAURAI_CORE_USER_ID",
                     "literal": "treat as user id"
                 }
             }
@@ -39,8 +44,9 @@ pub(crate) fn data() -> Value {
             }
         },
         "runtime_context": {
-            "primary": "AIONUI_CONVERSATION_ID",
-            "environment": RUNTIME_ENV
+            "primary": "CENTAURAI_CORE_CONVERSATION_ID",
+            "environment": RUNTIME_ENV,
+            "legacy_environment": LEGACY_RUNTIME_ENV
         },
         "safety": {
             "redacted_by_default": [

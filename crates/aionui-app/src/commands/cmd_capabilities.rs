@@ -6,6 +6,12 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 
 const RUNTIME_ENV: [&str; 4] = [
+    "CENTAURAI_CORE_HELPER_BIN",
+    "CENTAURAI_CORE_BASE_URL",
+    "CENTAURAI_CORE_CONVERSATION_ID",
+    "CENTAURAI_CORE_USER_ID",
+];
+const LEGACY_RUNTIME_ENV: [&str; 4] = [
     "AIONUI_HELPER_BIN",
     "AIONUI_BASE_URL",
     "AIONUI_CONVERSATION_ID",
@@ -41,17 +47,18 @@ fn data() -> Value {
             }
         },
         "runtime_context": {
-            "primary": "AIONUI_CONVERSATION_ID",
+            "primary": "CENTAURAI_CORE_CONVERSATION_ID",
             "environment": RUNTIME_ENV,
+            "legacy_environment": LEGACY_RUNTIME_ENV,
             "selectors": {
                 "conversation_id": {
-                    "current": "resolve from AIONUI_CONVERSATION_ID"
+                    "current": "resolve from CENTAURAI_CORE_CONVERSATION_ID"
                 },
                 "assistant_id": {
                     "current": "resolve via current conversation"
                 },
                 "user_id": {
-                    "current": "resolve from AIONUI_USER_ID"
+                    "current": "resolve from CENTAURAI_CORE_USER_ID"
                 }
             }
         },
@@ -68,7 +75,7 @@ fn data() -> Value {
                 "contract": "agent-facing-config-cli",
                 "contract_command": "config capabilities",
                 "invocation": "centaurai-core config capabilities",
-                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"],
+                "runtime_required": ["CENTAURAI_CORE_BASE_URL", "CENTAURAI_CORE_CONVERSATION_ID", "CENTAURAI_CORE_USER_ID"],
                 "safety": {
                     "can_write": true,
                     "read_before_write": true,
@@ -82,8 +89,8 @@ fn data() -> Value {
                 "contract": "agent-facing-diagnose-cli",
                 "contract_command": "diagnose capabilities",
                 "invocation": "centaurai-core diagnose capabilities",
-                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID"],
-                "optional_runtime": ["AIONUI_LOG_DIR"],
+                "runtime_required": ["CENTAURAI_CORE_BASE_URL", "CENTAURAI_CORE_CONVERSATION_ID", "CENTAURAI_CORE_USER_ID"],
+                "optional_runtime": ["CENTAURAI_CORE_LOG_DIR"],
                 "safety": {
                     "can_write": false,
                     "read_only": true,

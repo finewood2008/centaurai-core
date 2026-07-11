@@ -23,12 +23,34 @@ Products should consume CentaurAI Core as a versioned service executable, not
 as an unstable Rust library API. The supported host boundary is:
 
 - REST APIs under `/api/*`, with `/health` for readiness checks.
+- The public `GET /api/capabilities` negotiation document. Hosts should check
+  its REST, WebSocket, startup, and feature versions before enabling optional
+  integrations.
 - Real-time events through the `/ws` WebSocket endpoint.
 - A product-specific `--data-dir`, containing the SQLite database and runtime
   state. The established database filename is `aionui-backend.db`.
-- The legacy stdout listening record
-  `AIONCORE_LISTENING {"host":"127.0.0.1","port":25808}`. Hosts must parse
-  the JSON payload rather than assume a fixed port.
+- The canonical stdout listening record
+  `CENTAURAI_CORE_LISTENING {"host":"127.0.0.1","port":25808}`, followed by
+  the legacy-compatible `AIONCORE_LISTENING` record with the same payload.
+  Hosts must parse the JSON payload rather than assume a fixed port.
+
+Canonical process configuration uses `CENTAURAI_CORE_*` environment variables.
+For each migrated setting, the equivalent legacy `AIONUI_*` name remains
+effective; the canonical value wins when both are set. Spawned agent runtimes
+receive both namespaces during the compatibility window.
+
+Trusted proxy identity headers use `x-centaurai-proxy-user-id`,
+`x-centaurai-proxy-username`, `x-centaurai-proxy-role`,
+`x-centaurai-proxy-timestamp`, and `x-centaurai-proxy-signature`. The complete
+legacy `x-aionui-proxy-*` family remains accepted. A partial canonical family
+fails closed instead of falling back to legacy values.
+
+Provider credentials are write-only in create/update requests. Provider
+responses return `api_key_mask`, `key_id`, and `api_key_present`; the legacy
+`api_key` response field is retained only as a masked compatibility alias.
+Clients must omit `api_key` on updates unless the user supplies a new plaintext
+secret. Values beginning with `masked:v1:` are response placeholders and are
+rejected on write.
 
 Existing AionCore-compatible integrations are a deliberate compatibility
 target. Changes to REST behavior, WebSocket event names or payloads, the startup
@@ -51,8 +73,9 @@ artifact through that product's normal release pipeline. For an embedded host:
 product host
   -> start centaurai-core with --host 127.0.0.1 --port 0
        --data-dir <product-owned-dir>
-  -> read AIONCORE_LISTENING from stdout
+  -> read CENTAURAI_CORE_LISTENING from stdout
   -> verify /health
+  -> negotiate /api/capabilities
   -> use /api/* and /ws
 ```
 

@@ -26,7 +26,16 @@ pub struct ServerEnvironment {
 /// Cheap, synchronous, no IO beyond creating the log directory.
 /// All subcommands that need logging and config should call this first.
 pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironment, BootstrapError> {
-    let log_dir = cli.log_dir.clone().unwrap_or_else(|| cli.data_dir.join("logs"));
+    let log_dir = cli
+        .log_dir
+        .clone()
+        .or_else(|| {
+            std::env::var("AIONUI_LOG_DIR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(Into::into)
+        })
+        .unwrap_or_else(|| cli.data_dir.join("logs"));
     let log_guard = init_tracing(&log_dir, cli.log_level.as_deref())?;
 
     info!(
@@ -40,6 +49,9 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     // SAFETY: called before any service initialization; no concurrent reads.
     unsafe {
         std::env::set_var("AIONUI_WORK_DIR", &work_dir);
+        std::env::set_var("CENTAURAI_CORE_WORK_DIR", &work_dir);
+        std::env::set_var("AIONUI_LOG_DIR", &log_dir);
+        std::env::set_var("CENTAURAI_CORE_LOG_DIR", &log_dir);
     }
 
     let config = AppConfig {

@@ -1,12 +1,17 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{AgentRegistry, AgentService};
+use aionui_ai_agent::{AgentRegistry, AgentRouterState, AgentService, agent_routes};
 use aionui_api_types::{AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus};
+use aionui_auth::CurrentUser;
 use aionui_db::{
     IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteProviderRepository,
     UpdateAgentAvailabilitySnapshotParams, UpsertAgentMetadataParams, init_database_memory,
 };
 use aionui_realtime::EventBroadcaster;
+use axum::Extension;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
 
 struct NoopBroadcaster;
 
@@ -286,6 +291,65 @@ async fn management_list_keeps_hydrated_installation_without_reprobing_path() {
 
     assert_eq!(cached.status, AgentManagementStatus::Unchecked);
     assert!(cached.installed, "management list should not refresh PATH on read");
+}
+
+#[tokio::test]
+async fn management_refresh_route_reprobes_installation_and_returns_rows() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let command_path = temp.path().join("refreshable-agent-command");
+    std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let command = command_path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+
+    repo.upsert(&custom_params(
+        "agent-refreshable",
+        "Refreshable Agent",
+        &command,
+        &source_info,
+    ))
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    assert!(registry.get("agent-refreshable").await.unwrap().available);
+    std::fs::remove_file(&command_path).unwrap();
+
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+    let app = agent_routes(AgentRouterState {
+        agent_registry: registry,
+        service,
+    })
+    .layer(Extension(CurrentUser {
+        id: "system_default_user".into(),
+        username: "admin".into(),
+        is_admin: true,
+    }));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/management/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let refreshed = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "agent-refreshable")
+        .unwrap();
+    assert_eq!(refreshed["installed"], false);
+    assert_eq!(refreshed["status"], "missing");
 }
 
 #[tokio::test]

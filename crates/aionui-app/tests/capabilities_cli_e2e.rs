@@ -35,7 +35,17 @@ async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
     assert_eq!(stdout["meta"]["schema_version"], 1);
     assert_eq!(stdout["data"]["contract"], "agent-facing-centaurai-core-cli");
     assert_eq!(stdout["data"]["entrypoint"], "centaurai-core capabilities");
-    assert_eq!(stdout["data"]["runtime_context"]["primary"], "AIONUI_CONVERSATION_ID");
+    assert_eq!(
+        stdout["data"]["runtime_context"]["primary"],
+        "CENTAURAI_CORE_CONVERSATION_ID"
+    );
+    assert!(
+        stdout["data"]["runtime_context"]["legacy_environment"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "AIONUI_CONVERSATION_ID")
+    );
 
     let domains = stdout["data"]["domains"]
         .as_array()
