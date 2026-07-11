@@ -38,6 +38,8 @@ async fn health_check_returns_ok() {
     let json = response_json(response.into_body()).await;
     assert_eq!(json["status"], "ok");
     assert_eq!(json["service"], "centaurai-core");
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    assert!(json["commit"].as_str().is_some_and(|value| !value.is_empty()));
 }
 
 #[tokio::test]

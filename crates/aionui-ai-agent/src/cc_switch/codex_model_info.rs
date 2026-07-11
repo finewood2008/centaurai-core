@@ -69,10 +69,7 @@ fn read_codex_models_cache(path: &std::path::Path) -> Vec<(String, String)> {
                 continue;
             }
             let slug = m.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-            let display = m
-                .get("display_name")
-                .and_then(|d| d.as_str())
-                .unwrap_or(slug);
+            let display = m.get("display_name").and_then(|d| d.as_str()).unwrap_or(slug);
             let priority = m.get("priority").and_then(|p| p.as_i64()).unwrap_or(i64::MAX);
             if !slug.is_empty() {
                 models.push((slug.to_owned(), display.to_owned(), priority));
@@ -81,10 +78,7 @@ fn read_codex_models_cache(path: &std::path::Path) -> Vec<(String, String)> {
     }
 
     models.sort_by_key(|(_, _, p)| *p);
-    models
-        .into_iter()
-        .map(|(slug, display, _)| (slug, display))
-        .collect()
+    models.into_iter().map(|(slug, display, _)| (slug, display)).collect()
 }
 
 /// Read Codex model info from cc-switch, enriched with models_cache.json.

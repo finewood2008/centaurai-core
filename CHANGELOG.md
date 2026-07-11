@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## [0.1.46](https://github.com/finewood2008/centaurai-core/compare/v0.1.45...v0.1.46) (2026-07-11)
+
+### Features
+
+- Added cc-switch Codex provider environment support, model recognition, and
+  `models_cache.json` fallback handling for managed ACP launches.
 
 ### Changed
 
@@ -10,6 +15,10 @@
   `centaurai-core` while preserving the existing REST, WebSocket, SQLite, log,
   environment-variable, and `AIONCORE_LISTENING` compatibility surfaces.
 - Added the `service: "centaurai-core"` identity field to the health response.
+- Embedded the source commit in each binary and exposed it in the health
+  response for package provenance diagnostics.
+- Added release-contract gates for version/tag alignment and the six supported
+  release artifacts.
 
 ## [0.1.45](https://github.com/iOfficeAI/AionCore/compare/v0.1.44...v0.1.45) (2026-07-10)
 

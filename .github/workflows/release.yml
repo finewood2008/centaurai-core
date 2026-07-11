@@ -51,6 +51,10 @@ jobs:
           version="${RELEASE_TAG#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify release contract
+        shell: bash
+        run: scripts/check-release-contract.sh "${RELEASE_TAG}"
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
