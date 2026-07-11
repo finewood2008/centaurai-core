@@ -24,6 +24,7 @@ pub(super) fn apply_acp_launch_policy(command_spec: &mut CommandSpec, input: Acp
     );
     append_runtime_env(command_spec, input.runtime_env);
     append_claude_provider_env(command_spec, input.metadata);
+    append_codex_provider_env(command_spec, input.metadata);
 }
 
 fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, String)]) {
@@ -52,7 +53,27 @@ fn append_claude_provider_env(command_spec: &mut CommandSpec, metadata: &AgentMe
             value: value.clone(),
         });
     }
-    tracing::info!(?keys, "cc-switch: env vars injected");
+    tracing::info!(?keys, "cc-switch: Claude env vars injected");
+}
+
+fn append_codex_provider_env(command_spec: &mut CommandSpec, metadata: &AgentMetadata) {
+    if metadata.backend.as_deref() != Some("codex") {
+        return;
+    }
+
+    let cc_switch_env = cc_switch::read_codex_provider_env();
+    if cc_switch_env.is_empty() {
+        return;
+    }
+
+    let keys: Vec<&str> = cc_switch_env.keys().map(|key| key.as_str()).collect();
+    for (name, value) in &cc_switch_env {
+        command_spec.env.push(aionui_common::EnvVar {
+            name: name.clone(),
+            value: value.clone(),
+        });
+    }
+    tracing::info!(?keys, "cc-switch: Codex env vars injected");
 }
 
 fn initial_mode_from_build_context(

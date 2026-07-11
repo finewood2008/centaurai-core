@@ -317,6 +317,8 @@ impl AgentInstance {
                 let sdk_info = sdk_model.map(map_sdk_model_to_payload);
                 let cc_switch_info = if m.is_claude_backend() {
                     crate::cc_switch::read_claude_model_info()
+                } else if m.is_codex_backend() {
+                    crate::cc_switch::read_codex_model_info()
                 } else {
                     None
                 };

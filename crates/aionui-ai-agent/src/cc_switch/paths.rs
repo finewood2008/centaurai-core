@@ -5,6 +5,8 @@ pub struct CcSwitchPaths {
     pub settings_path: PathBuf,
     pub database_path: PathBuf,
     pub claude_settings_path: PathBuf,
+    pub codex_settings_path: PathBuf,
+    pub codex_models_cache_path: PathBuf,
 }
 
 impl CcSwitchPaths {
@@ -14,6 +16,8 @@ impl CcSwitchPaths {
             settings_path: base.join("settings.json"),
             database_path: base.join("cc-switch.db"),
             claude_settings_path: home.join(".claude").join("settings.json"),
+            codex_settings_path: home.join(".codex").join("config.toml"),
+            codex_models_cache_path: home.join(".codex").join("models_cache.json"),
         }
     }
 
@@ -38,6 +42,14 @@ mod tests {
         assert_eq!(
             paths.claude_settings_path,
             Path::new("/home/testuser/.claude/settings.json")
+        );
+        assert_eq!(
+            paths.codex_settings_path,
+            Path::new("/home/testuser/.codex/config.toml")
+        );
+        assert_eq!(
+            paths.codex_models_cache_path,
+            Path::new("/home/testuser/.codex/models_cache.json")
         );
     }
 

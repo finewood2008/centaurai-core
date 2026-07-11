@@ -570,6 +570,10 @@ impl AcpAgentManager {
         self.params.metadata.backend.as_deref() == Some("claude")
     }
 
+    pub(crate) fn is_codex_backend(&self) -> bool {
+        self.params.metadata.backend.as_deref() == Some("codex")
+    }
+
     /// Cached model info from the ACP backend, if any has been received.
     pub(crate) async fn model(&self) -> Option<SessionModelState> {
         self.session.read().await.model_info().cloned()
