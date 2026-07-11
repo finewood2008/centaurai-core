@@ -36,11 +36,12 @@ env:
 jobs:
   prepare-release:
     name: Prepare Release Metadata
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.metadata.outputs.version }}
+      commit: ${{ steps.metadata.outputs.commit }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
@@ -50,6 +51,7 @@ jobs:
         run: |
           version="${RELEASE_TAG#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Verify release contract
         shell: bash
@@ -95,11 +97,11 @@ jobs:
             rustflags: "-C target-feature=+crt-static"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # pinned stable action
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
@@ -110,7 +112,7 @@ jobs:
         run: Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -Force -ErrorAction SilentlyContinue
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           # Include runner OS image and cross baseline in the cache key.
           # Proc-macro .so files link against the host GLIBC, so switching
@@ -175,7 +177,7 @@ jobs:
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.target }}
           path: dist/${{ env.ARCHIVE }}
@@ -183,21 +185,54 @@ jobs:
 
   github-release:
     name: Upload GitHub Release assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - prepare-release
       - build
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Generate checksums
         shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare-release.outputs.commit }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           cd artifacts
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          assets = {}
+          for path in sorted(Path(".").glob("centaurai-core-v*")):
+              assets[path.name] = {
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": path.stat().st_size,
+              }
+          if len(assets) != 6:
+              raise SystemExit(f"expected six platform assets, found {len(assets)}")
+          manifest = {
+              "schema_version": 1,
+              "name": "centaurai-core",
+              "version": os.environ["VERSION"],
+              "repository": os.environ["REPOSITORY"],
+              "tag": os.environ["RELEASE_TAG"],
+              "commit": os.environ["SOURCE_COMMIT"],
+              "assets": assets,
+          }
+          Path("centaurai-core-release.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
           sha256sum centaurai-core-* > centaurai-core-checksums.txt
 
       - name: Upload release assets

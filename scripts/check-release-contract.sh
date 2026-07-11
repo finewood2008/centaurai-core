@@ -54,5 +54,14 @@ grep -Fq '$archive = "centaurai-core-v${env:VERSION}-${{ matrix.target }}.zip"' 
   || fail "Windows archive naming contract is missing"
 grep -Fq 'sha256sum centaurai-core-* > centaurai-core-checksums.txt' "$release_workflow" \
   || fail "checksum asset generation is missing"
+grep -Fq 'centaurai-core-release.json' "$release_workflow" \
+  || fail "release provenance manifest is missing"
+grep -Fq '"commit": os.environ["SOURCE_COMMIT"]' "$release_workflow" \
+  || fail "release manifest does not record the source commit"
+
+while IFS= read -r action_ref; do
+  [[ "$action_ref" =~ @[0-9a-f]{40}([[:space:]]|$) ]] \
+    || fail "release action is not pinned to a commit: ${action_ref}"
+done < <(sed -n 's/^[[:space:]]*uses:[[:space:]]*//p' "$release_workflow")
 
 echo "CentaurAI Core release contract passed for v${workspace_version}"

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.48](https://github.com/finewood2008/centaurai-core/compare/v0.1.47...v0.1.48) (2026-07-12)
+
+### Features
+
+- Added the versioned `/api/capabilities` integration contract and the standard
+  agent-management refresh endpoint.
+- Added canonical `CENTAURAI_CORE_*` configuration aliases, proxy identity
+  headers, and the `CENTAURAI_CORE_LISTENING` startup handshake while retaining
+  the legacy compatibility handshake.
+- Made provider secrets write-only and returned only masked values plus stable
+  key identifiers from read APIs.
+
+### Release integrity
+
+- Release workflows now pin every third-party action to a commit and publish a
+  provenance manifest containing the exact source commit and SHA-256 digest of
+  all six platform assets.
+
 ## [0.1.46](https://github.com/finewood2008/centaurai-core/compare/v0.1.45...v0.1.46) (2026-07-11)
 
 ### Features
