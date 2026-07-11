@@ -23,6 +23,7 @@ use aionui_db::{
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
+use aionui_decision::{DecisionRepository, DecisionRouterState, DecisionService, ProviderBrainRuntime};
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -118,6 +119,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub decision: DecisionRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -220,6 +222,15 @@ pub async fn build_module_states(
     let (channel_state, channel_components) = build_channel_state(services, ext_state.registry.clone()).await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
+    let decision = build_decision_state(services);
+    decision.service.recover_interrupted().await.map_err(|error| {
+        RouterBuildError::new(
+            "router.decision.recover",
+            "failed to recover interrupted decision sessions",
+        )
+        .with_source(error)
+    })?;
+
     let backend_binary_path = Arc::new(
         std::env::current_exe()
             .ok()
@@ -283,6 +294,7 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        decision,
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -295,6 +307,23 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+/// Build the persisted multi-brain decision state from the shared provider catalog.
+pub fn build_decision_state(services: &AppServices) -> DecisionRouterState {
+    let provider_repo: Arc<dyn IProviderRepository> =
+        Arc::new(SqliteProviderRepository::new(services.database.pool().clone()));
+    let runtime = Arc::new(ProviderBrainRuntime::new(
+        provider_repo,
+        derive_encryption_key(&services.jwt_secret_raw),
+    ));
+    let service = DecisionService::new(
+        DecisionRepository::new(services.database.pool().clone()),
+        runtime.clone(),
+        runtime,
+        services.event_bus.clone(),
+    );
+    DecisionRouterState { service }
 }
 
 /// Build the default `AssistantRouterState` from application services.

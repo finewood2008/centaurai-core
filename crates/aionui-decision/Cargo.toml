@@ -1,0 +1,27 @@
+[package]
+name = "aionui-decision"
+version.workspace = true
+edition.workspace = true
+description = "Persisted multi-brain decision orchestration"
+license.workspace = true
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-auth.workspace = true
+aionui-common.workspace = true
+aionui-db.workspace = true
+aionui-realtime.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock = "0.6"

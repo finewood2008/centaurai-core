@@ -403,6 +403,7 @@ dependencies = [
  "aionui-conversation",
  "aionui-cron",
  "aionui-db",
+ "aionui-decision",
  "aionui-extension",
  "aionui-file",
  "aionui-mcp",
@@ -625,6 +626,29 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aionui-decision"
+version = "0.1.48"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

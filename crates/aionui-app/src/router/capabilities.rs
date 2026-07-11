@@ -22,6 +22,10 @@ const WEBSOCKET_EVENTS: &[&str] = &[
     "cron.job-executed",
     "cron.job-removed",
     "cron.job-updated",
+    "decision.completed",
+    "decision.evidenceAdded",
+    "decision.sessionChanged",
+    "decision.turnDelta",
     "excel-preview.status",
     "extensions.lifecycle",
     "extensions.state-changed",
@@ -78,6 +82,7 @@ fn capabilities() -> CoreCapabilitiesResponse {
             ("agent_management_refresh".into(), true),
             ("centaurai_environment_aliases".into(), true),
             ("centaurai_proxy_identity_headers".into(), true),
+            ("decisions".into(), true),
             ("logical_model_routes".into(), true),
             ("mcp".into(), true),
             ("provider_secret_redaction".into(), true),
@@ -115,6 +120,7 @@ mod tests {
         assert_eq!(body["success"], true);
         assert_eq!(body["data"]["contract"]["rest"], "1");
         assert_eq!(body["data"]["features"]["agent_management_refresh"], true);
+        assert_eq!(body["data"]["features"]["decisions"], true);
         assert_eq!(body["data"]["websocket"]["version"], "1");
         assert!(
             body["data"]["websocket"]["events"]
@@ -122,6 +128,13 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|event| event == "team.agentStatusChanged")
+        );
+        assert!(
+            body["data"]["websocket"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event == "decision.completed")
         );
     }
 }
