@@ -11,6 +11,9 @@ pub struct AgentRuntimePolicyRow {
     pub confirmation_timeout_ms: i64,
     pub resident_task_limit: i64,
     pub resident_idle_timeout_ms: i64,
+    pub memory_constrained_percent: f64,
+    pub memory_pause_percent: f64,
+    pub memory_reject_percent: f64,
 }
 
 #[derive(Debug, Clone)]

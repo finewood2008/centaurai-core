@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 const DEFAULT_TURN_ESTIMATE_MS: u64 = 60_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimePolicy {
     pub mode: AgentRuntimeMode,
     pub global_active_limit: usize,
@@ -24,6 +24,9 @@ pub struct RuntimePolicy {
     pub confirmation_timeout_ms: u64,
     pub resident_task_limit: usize,
     pub resident_idle_timeout_ms: u64,
+    pub memory_constrained_percent: f32,
+    pub memory_pause_percent: f32,
+    pub memory_reject_percent: f32,
 }
 
 impl Default for RuntimePolicy {
@@ -43,6 +46,9 @@ impl Default for RuntimePolicy {
             confirmation_timeout_ms: 5 * 60 * 1000,
             resident_task_limit: 6,
             resident_idle_timeout_ms: 3 * 60 * 1000,
+            memory_constrained_percent: 75.0,
+            memory_pause_percent: 85.0,
+            memory_reject_percent: 90.0,
         }
     }
 }
@@ -59,6 +65,9 @@ impl RuntimePolicy {
             confirmation_timeout_ms: self.confirmation_timeout_ms,
             resident_task_limit: self.resident_task_limit,
             resident_idle_timeout_ms: self.resident_idle_timeout_ms,
+            memory_constrained_percent: self.memory_constrained_percent,
+            memory_pause_percent: self.memory_pause_percent,
+            memory_reject_percent: self.memory_reject_percent,
         }
     }
 
@@ -90,6 +99,14 @@ impl RuntimePolicy {
         if let Some(value) = update.resident_idle_timeout_ms {
             self.resident_idle_timeout_ms = value.clamp(1_000, 24 * 60 * 60 * 1000);
         }
+        let constrained = update
+            .memory_constrained_percent
+            .unwrap_or(self.memory_constrained_percent);
+        let paused = update.memory_pause_percent.unwrap_or(self.memory_pause_percent);
+        let rejecting = update.memory_reject_percent.unwrap_or(self.memory_reject_percent);
+        self.memory_constrained_percent = constrained.clamp(50.0, 97.0);
+        self.memory_pause_percent = paused.clamp(self.memory_constrained_percent + 1.0, 98.0);
+        self.memory_reject_percent = rejecting.clamp(self.memory_pause_percent + 1.0, 100.0);
     }
 }
 
@@ -298,6 +315,9 @@ impl AgentRunScheduler {
             confirmation_timeout_ms: policy_to_save.confirmation_timeout_ms as i64,
             resident_task_limit: policy_to_save.resident_task_limit as i64,
             resident_idle_timeout_ms: policy_to_save.resident_idle_timeout_ms as i64,
+            memory_constrained_percent: policy_to_save.memory_constrained_percent as f64,
+            memory_pause_percent: policy_to_save.memory_pause_percent as f64,
+            memory_reject_percent: policy_to_save.memory_reject_percent as f64,
         };
         if let Err(error) = self.repo.save_runtime_policy(&row, now_ms()).await {
             error!(error = %error, "failed to persist agent runtime policy");
@@ -306,12 +326,12 @@ impl AgentRunScheduler {
         response
     }
 
-    pub fn memory_state(&self) -> (Option<f32>, MemoryState) {
+    pub fn memory_state(&self, policy: &RuntimePolicy) -> (Option<f32>, MemoryState) {
         let percent = self.memory.used_percent();
         let state = match percent {
-            Some(value) if value >= 90.0 => MemoryState::Rejecting,
-            Some(value) if value >= 85.0 => MemoryState::Paused,
-            Some(value) if value >= 75.0 => MemoryState::Constrained,
+            Some(value) if value >= policy.memory_reject_percent => MemoryState::Rejecting,
+            Some(value) if value >= policy.memory_pause_percent => MemoryState::Paused,
+            Some(value) if value >= policy.memory_constrained_percent => MemoryState::Constrained,
             _ => MemoryState::Normal,
         };
         (percent, state)
@@ -330,7 +350,7 @@ impl AgentRunScheduler {
 
     pub async fn preflight(&self, user_id: &str) -> Result<(), RunAdmissionError> {
         let policy = self.policy();
-        let (_, memory) = self.memory_state();
+        let (_, memory) = self.memory_state(&policy);
         if memory == MemoryState::Rejecting {
             return Err(RunAdmissionError::MemoryPressure);
         }
@@ -427,7 +447,7 @@ impl AgentRunScheduler {
     async fn dispatch_available(&self) {
         loop {
             let policy = self.policy();
-            let (_, memory) = self.memory_state();
+            let (_, memory) = self.memory_state(&policy);
             let effective_limit = self.effective_limit(&policy, memory);
             let next = {
                 let mut state = self.state.lock().await;
@@ -632,7 +652,7 @@ impl AgentRunScheduler {
 
     pub async fn status(&self, resident_task_count: usize) -> AgentRuntimeStatusResponse {
         let policy = self.policy();
-        let (percent, memory) = self.memory_state();
+        let (percent, memory) = self.memory_state(&policy);
         let state = self.state.lock().await;
         AgentRuntimeStatusResponse {
             memory_used_percent: percent,
@@ -788,6 +808,9 @@ mod tests {
                 confirmation_timeout_ms: None,
                 resident_task_limit: None,
                 resident_idle_timeout_ms: None,
+                memory_constrained_percent: None,
+                memory_pause_percent: None,
+                memory_reject_percent: None,
             })
             .await;
         (scheduler, database, user_1.id, user_2.id)
@@ -893,6 +916,9 @@ mod tests {
                     confirmation_timeout_ms: None,
                     resident_task_limit: None,
                     resident_idle_timeout_ms: None,
+                    memory_constrained_percent: None,
+                    memory_pause_percent: None,
+                    memory_reject_percent: None,
                 })
                 .await;
             let status = scheduler.status(0).await;
@@ -905,6 +931,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn administrator_memory_thresholds_change_admission_state() {
+        let (scheduler, _database, _user_1, _user_2) = scheduler_with_users(72.0).await;
+        let policy = scheduler
+            .update_policy(UpdateAgentRuntimePolicyRequest {
+                mode: None,
+                global_active_limit: None,
+                per_user_active_limit: None,
+                per_user_queue_limit: None,
+                global_queue_limit: None,
+                queue_timeout_ms: None,
+                confirmation_timeout_ms: None,
+                resident_task_limit: None,
+                resident_idle_timeout_ms: None,
+                memory_constrained_percent: Some(60.0),
+                memory_pause_percent: Some(70.0),
+                memory_reject_percent: Some(80.0),
+            })
+            .await;
+        assert_eq!(policy.memory_pause_percent, 70.0);
+        let status = scheduler.status(0).await;
+        assert_eq!(status.memory_state, "paused");
+        assert_eq!(status.effective_active_limit, 0);
     }
 
     #[tokio::test]
@@ -950,6 +1001,9 @@ mod tests {
                 confirmation_timeout_ms: None,
                 resident_task_limit: None,
                 resident_idle_timeout_ms: None,
+                memory_constrained_percent: None,
+                memory_pause_percent: None,
+                memory_reject_percent: None,
             })
             .await;
         let mut first = scheduler

@@ -18,13 +18,13 @@ impl SqliteAgentRunRepository {
 #[async_trait::async_trait]
 impl IAgentRunRepository for SqliteAgentRunRepository {
     async fn load_runtime_policy(&self) -> Result<AgentRuntimePolicyRow, DbError> {
-        Ok(sqlx::query_as("SELECT mode, global_active_limit, per_user_active_limit, per_user_queue_limit, global_queue_limit, queue_timeout_ms, confirmation_timeout_ms, resident_task_limit, resident_idle_timeout_ms FROM agent_runtime_policy WHERE singleton = 1")
+        Ok(sqlx::query_as("SELECT mode, global_active_limit, per_user_active_limit, per_user_queue_limit, global_queue_limit, queue_timeout_ms, confirmation_timeout_ms, resident_task_limit, resident_idle_timeout_ms, memory_constrained_percent, memory_pause_percent, memory_reject_percent FROM agent_runtime_policy WHERE singleton = 1")
             .fetch_one(&self.pool)
             .await?)
     }
 
     async fn save_runtime_policy(&self, policy: &AgentRuntimePolicyRow, updated_at: i64) -> Result<(), DbError> {
-        sqlx::query("UPDATE agent_runtime_policy SET mode = ?, global_active_limit = ?, per_user_active_limit = ?, per_user_queue_limit = ?, global_queue_limit = ?, queue_timeout_ms = ?, confirmation_timeout_ms = ?, resident_task_limit = ?, resident_idle_timeout_ms = ?, updated_at = ? WHERE singleton = 1")
+        sqlx::query("UPDATE agent_runtime_policy SET mode = ?, global_active_limit = ?, per_user_active_limit = ?, per_user_queue_limit = ?, global_queue_limit = ?, queue_timeout_ms = ?, confirmation_timeout_ms = ?, resident_task_limit = ?, resident_idle_timeout_ms = ?, memory_constrained_percent = ?, memory_pause_percent = ?, memory_reject_percent = ?, updated_at = ? WHERE singleton = 1")
             .bind(&policy.mode)
             .bind(policy.global_active_limit)
             .bind(policy.per_user_active_limit)
@@ -34,6 +34,9 @@ impl IAgentRunRepository for SqliteAgentRunRepository {
             .bind(policy.confirmation_timeout_ms)
             .bind(policy.resident_task_limit)
             .bind(policy.resident_idle_timeout_ms)
+            .bind(policy.memory_constrained_percent)
+            .bind(policy.memory_pause_percent)
+            .bind(policy.memory_reject_percent)
             .bind(updated_at)
             .execute(&self.pool)
             .await?;

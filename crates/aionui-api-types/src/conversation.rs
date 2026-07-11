@@ -192,7 +192,7 @@ pub enum AgentRuntimeMode {
     Enforce,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentRuntimePolicyResponse {
     pub mode: AgentRuntimeMode,
     pub global_active_limit: usize,
@@ -203,9 +203,12 @@ pub struct AgentRuntimePolicyResponse {
     pub confirmation_timeout_ms: u64,
     pub resident_task_limit: usize,
     pub resident_idle_timeout_ms: u64,
+    pub memory_constrained_percent: f32,
+    pub memory_pause_percent: f32,
+    pub memory_reject_percent: f32,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct UpdateAgentRuntimePolicyRequest {
     pub mode: Option<AgentRuntimeMode>,
     pub global_active_limit: Option<usize>,
@@ -216,6 +219,9 @@ pub struct UpdateAgentRuntimePolicyRequest {
     pub confirmation_timeout_ms: Option<u64>,
     pub resident_task_limit: Option<usize>,
     pub resident_idle_timeout_ms: Option<u64>,
+    pub memory_constrained_percent: Option<f32>,
+    pub memory_pause_percent: Option<f32>,
+    pub memory_reject_percent: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
