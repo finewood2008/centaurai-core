@@ -1,7 +1,9 @@
 # 架构文档
 
-AionCore 是 AionUi 的后端服务，使用 Rust 构建（Axum + Tokio + SQLite）。
-它通过 HTTP REST API 和 WebSocket 实时事件为 AionUi 桌面客户端提供服务。
+CentaurAI Core 是 CentaurAI 各产品共享的后端核心，使用 Rust 构建（Axum + Tokio + SQLite）。
+它作为 AionCore 的下游 fork 独立维护，并在迁移期间保持兼容的 HTTP REST API 与
+WebSocket 事件边界。内部 `aionui-*` crate 名称第一阶段保持不变，以降低同步上游和
+数据兼容的风险。
 
 ## 技术栈
 

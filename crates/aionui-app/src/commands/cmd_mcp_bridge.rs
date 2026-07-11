@@ -1,6 +1,6 @@
-//! `aioncore mcp-bridge` subcommand: stdio ↔ TCP bridge for the team MCP server.
+//! `centaurai-core mcp-bridge` subcommand: stdio ↔ TCP bridge for the team MCP server.
 //!
-//! Spawned by the ACP agent CLI as an MCP server with command `aioncore mcp-bridge`.
+//! Spawned by the ACP agent CLI as an MCP server with command `centaurai-core mcp-bridge`.
 //! stdio side speaks MCP Content-Length framed JSON-RPC 2.0;
 //! TCP side speaks 4-byte big-endian length-prefixed JSON frames against
 //! `127.0.0.1:<TEAM_MCP_PORT>` (reusing `aionui_team::mcp::protocol`).
@@ -29,7 +29,7 @@ const MCP_STDIO_HEADER_LINE_MAX_BYTES: usize = 8 * 1024;
 const MCP_STDIO_HEADER_SECTION_MAX_BYTES: usize = 16 * 1024;
 const MCP_STDIO_HEADER_MAX_COUNT: usize = 64;
 
-/// Entry point for `aioncore mcp-bridge`. Returns an [`ExitCode`] so the
+/// Entry point for `centaurai-core mcp-bridge`. Returns an [`ExitCode`] so the
 /// binary surfaces non-zero on any failure (ACP CLI uses that to mark the MCP
 /// server as broken).
 pub async fn run_mcp_bridge() -> ExitCode {

@@ -1,4 +1,4 @@
-//! `aioncore config` subcommand: agent-facing automation CLI for AionUi config.
+//! `centaurai-core config` subcommand: agent-facing automation CLI for AionUi config.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

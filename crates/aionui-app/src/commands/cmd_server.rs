@@ -1,4 +1,4 @@
-//! `aioncore` (no subcommand): the main HTTP server.
+//! `centaurai-core` (no subcommand): the main HTTP server.
 
 use std::io::{self, Write};
 use std::net::SocketAddr;

@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 env:
-  BINARY_NAME: aioncore
+  BINARY_NAME: centaurai-core
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
@@ -68,26 +68,26 @@ jobs:
           # deliberately drop it.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            binary_name: aioncore
+            binary_name: centaurai-core
           # Linux aarch64: keep `cross` (its image happens to not trip the
           # aws-lc-sys check and also yields an older GLIBC baseline).
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            binary_name: aioncore
+            binary_name: centaurai-core
             use_cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
-            binary_name: aioncore
+            binary_name: centaurai-core
           - os: macos-latest
             target: aarch64-apple-darwin
-            binary_name: aioncore
+            binary_name: centaurai-core
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary_name: aioncore.exe
+            binary_name: centaurai-core.exe
             rustflags: "-C target-feature=+crt-static"
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            binary_name: aioncore.exe
+            binary_name: centaurai-core.exe
             rustflags: "-C target-feature=+crt-static"
 
     steps:
@@ -155,7 +155,7 @@ jobs:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           mkdir -p dist
-          ARCHIVE="aioncore-v${VERSION}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="centaurai-core-v${VERSION}-${{ matrix.target }}.tar.gz"
           tar -C target/${{ matrix.target }}/release -czf "dist/${ARCHIVE}" ${{ matrix.binary_name }}
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
@@ -166,7 +166,7 @@ jobs:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $archive = "aioncore-v${env:VERSION}-${{ matrix.target }}.zip"
+          $archive = "centaurai-core-v${env:VERSION}-${{ matrix.target }}.zip"
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -194,7 +194,7 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          sha256sum aioncore-* > aioncore-checksums.txt
+          sha256sum centaurai-core-* > centaurai-core-checksums.txt
 
       - name: Upload release assets
         shell: bash

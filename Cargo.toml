@@ -27,7 +27,13 @@ members = [
 [workspace.package]
 version = "0.1.45"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
+
+[workspace.metadata.centaurai]
+service = "centaurai-core"
+upstream-repository = "https://github.com/iOfficeAI/AionCore.git"
+upstream-base-tag = "v0.1.45"
+upstream-base-commit = "928f91c8981bb2475040ff05792f01940eaebc97"
 
 [workspace.dependencies]
 # Internal crates

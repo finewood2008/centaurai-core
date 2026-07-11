@@ -1,14 +1,14 @@
 ---
 name: aionui-config
 description: >-
-  Configure AionUi itself through the bundled aioncore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an AionUi assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their AionUi installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
+  Configure AionUi itself through the bundled centaurai-core config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an AionUi assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their AionUi installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
 ---
 
 # AionUi Config
 
 Configure AionUi with the bundled agent-facing CLI. Do not discover ports, do
 not call raw backend paths, and do not depend on tools outside the bundled
-`aioncore` binary.
+`centaurai-core` binary.
 
 ## Rules
 
@@ -44,7 +44,7 @@ Failures print one stable error line to stderr. Treat stderr as authoritative.
 
 ## Capability Discovery
 
-Ask aioncore what this version supports:
+Ask CentaurAI Core what this version supports:
 
 ```bash
 "$AIONUI_HELPER_BIN" config capabilities

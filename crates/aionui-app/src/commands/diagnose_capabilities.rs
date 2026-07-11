@@ -1,4 +1,4 @@
-//! Agent-readable capability contract for `aioncore diagnose`.
+//! Agent-readable capability contract for `centaurai-core diagnose`.
 
 use serde_json::{Value, json};
 
@@ -80,7 +80,7 @@ pub(crate) fn data() -> Value {
             domain("logs", &[
                 command(CommandDescriptor {
                     path: &["logs", "tail"],
-                    description: "Tail aioncore logs from AIONUI_LOG_DIR or stdin log_dir.",
+                    description: "Tail CentaurAI Core logs from AIONUI_LOG_DIR or stdin log_dir.",
                     input: "stdin_json",
                     stdin_fields: &["log_dir", "lines", "errors_only", "conversation_id"],
                     selectors: &["conversation_id"],

@@ -11,6 +11,13 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  identity:
+    name: CentaurAI Identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash scripts/check-centaurai-identity.sh
+
   migration-immutability:
     name: Migration Immutability
     runs-on: ubuntu-latest

@@ -8,8 +8,8 @@ case "$(uname -s)" in
 esac
 
 case "$mode" in
-    release) binary="target/release/aioncore$exe_suffix" ;;
-    debug) binary="target/debug/aioncore$exe_suffix" ;;
+    release) binary="target/release/centaurai-core$exe_suffix" ;;
+    debug) binary="target/debug/centaurai-core$exe_suffix" ;;
     *) echo "unknown install mode: $mode" >&2; exit 1 ;;
 esac
 

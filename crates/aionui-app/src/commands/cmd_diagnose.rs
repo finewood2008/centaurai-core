@@ -1,4 +1,4 @@
-//! `aioncore diagnose` subcommand: agent-facing read-only troubleshooting CLI.
+//! `centaurai-core diagnose` subcommand: agent-facing read-only troubleshooting CLI.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

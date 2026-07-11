@@ -1,4 +1,4 @@
-//! E2E coverage for the agent-facing `aioncore diagnose` CLI.
+//! E2E coverage for the agent-facing `centaurai-core diagnose` CLI.
 
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -17,7 +17,7 @@ struct Capture {
 type SharedCapture = Arc<Mutex<Capture>>;
 
 fn diagnose_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_centaurai-core"));
     command.arg("diagnose");
     command
 }

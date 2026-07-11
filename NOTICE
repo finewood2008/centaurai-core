@@ -1,0 +1,20 @@
+CentaurAI Core
+
+This product is a derivative work based on AionCore:
+https://github.com/iOfficeAI/AionCore
+
+AionCore
+Copyright 2025 AionUi (aionui.com)
+
+The upstream work is licensed under the Apache License, Version 2.0. A copy of
+that license, including the upstream copyright notice, is provided in the
+LICENSE file distributed with this product.
+
+This fork contains modifications made for the CentaurAI Core project and is
+maintained independently from AionCore and AionUi. It is not represented as an
+official or endorsed release of either upstream project.
+
+The names AionCore and AionUi are used only to describe the origin of the work
+and compatibility with the upstream project. The Apache License 2.0 does not
+grant permission to use upstream trade names, trademarks, service marks, or
+product names except as required for reasonable and customary attribution.

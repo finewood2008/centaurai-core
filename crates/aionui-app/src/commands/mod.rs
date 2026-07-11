@@ -1,4 +1,4 @@
-//! Subcommand implementations for the `aioncore` binary.
+//! Subcommand implementations for the `centaurai-core` binary.
 //!
 //! This file is a façade — module declarations and re-exports only.
 //! All logic lives in the submodules.

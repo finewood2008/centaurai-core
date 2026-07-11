@@ -1,4 +1,4 @@
-//! `aioncore doctor` subcommand: agent CLI detection self-check.
+//! `centaurai-core doctor` subcommand: agent CLI detection self-check.
 //!
 //! Hydrates the agent registry against the real on-disk database and
 //! prints a per-agent availability table to stdout. Mirrors the

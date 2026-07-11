@@ -42,7 +42,7 @@
 | 技能 | 用途 | 性质 |
 | --- | --- | --- |
 | **aionui-config** | 创建/编辑助手、导入并绑定技能、配置 MCP、添加 LLM Provider 与 API Key、改应用/界面设置、创建与管理定时任务 | **写**（会改动用户的实时应用） |
-| **aionui-troubleshooting** | 查会话/运行状态、读 aioncore 日志、查 Provider 健康、cron / team / MCP 状态 | **只读**诊断 |
+| **aionui-troubleshooting** | 查会话/运行状态、读 CentaurAI Core 日志、查 Provider 健康、cron / team / MCP 状态 | **只读**诊断 |
 | **aionui-webui-public** | 把本机 AionUi 配置成可远程访问，生成外网访问链接 | **执行**（在用户机器上跑命令、建连接） |
 
 **判断规则**：

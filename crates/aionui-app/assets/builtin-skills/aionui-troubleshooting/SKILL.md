@@ -1,12 +1,12 @@
 ---
 name: aionui-troubleshooting
 description: >-
-  Diagnose a running AionUi installation: inspect stuck or errored conversations, read provider health, scheduled task state, MCP server health, team member state, backend health, and aioncore logs. Use when the user reports AionUi is misbehaving, a conversation is stuck, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they ask to troubleshoot AionUi.
+  Diagnose a running AionUi installation: inspect stuck or errored conversations, read provider health, scheduled task state, MCP server health, team member state, backend health, and CentaurAI Core logs. Use when the user reports AionUi is misbehaving, a conversation is stuck, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they ask to troubleshoot AionUi.
 ---
 
 # AionUi Troubleshooting
 
-Use the bundled `aioncore diagnose` CLI for read-only troubleshooting. It uses
+Use the bundled `centaurai-core diagnose` CLI for read-only troubleshooting. It uses
 the runtime context injected into the current agent conversation, so do not
 discover ports or call backend endpoints by hand.
 

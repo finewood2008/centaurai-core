@@ -2,10 +2,12 @@
 name = "aionui-app"
 version.workspace = true
 edition.workspace = true
+description = "CentaurAI shared agent orchestration backend"
+license.workspace = true
 exclude = ["data/**"]
 
 [[bin]]
-name = "aioncore"
+name = "centaurai-core"
 path = "src/main.rs"
 
 [features]

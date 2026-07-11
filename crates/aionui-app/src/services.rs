@@ -160,7 +160,7 @@ impl AppServices {
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
         // attached to a conversation (phase1 mcp.md §4.6 single-binary model).
         let backend_binary_path =
-            Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aioncore")));
+            Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("centaurai-core")));
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
 

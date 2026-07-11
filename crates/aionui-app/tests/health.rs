@@ -37,6 +37,7 @@ async fn health_check_returns_ok() {
 
     let json = response_json(response.into_body()).await;
     assert_eq!(json["status"], "ok");
+    assert_eq!(json["service"], "centaurai-core");
 }
 
 #[tokio::test]

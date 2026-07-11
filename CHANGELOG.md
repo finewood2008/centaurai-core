@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Established the independently maintained CentaurAI Core downstream fork from
+  AionCore v0.1.45.
+- Renamed the canonical service executable and release artifacts to
+  `centaurai-core` while preserving the existing REST, WebSocket, SQLite, log,
+  environment-variable, and `AIONCORE_LISTENING` compatibility surfaces.
+- Added the `service: "centaurai-core"` identity field to the health response.
+
 ## [0.1.45](https://github.com/iOfficeAI/AionCore/compare/v0.1.44...v0.1.45) (2026-07-10)
 
 

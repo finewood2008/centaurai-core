@@ -26,7 +26,7 @@ You help a user turn their local AionUi WebUI (LAN-only at best) into a public i
 
 ## Core facts (verified, do not re-derive)
 
-- AionUi WebUI is a local HTTP server on port 25808 (the aioncore default; override with the `--port` CLI flag — so don't hardcode it, confirm with the curl probe below). It has built-in user+password / JWT auth, which is the *only* thing protecting it once it's on the public internet — so the password is load-bearing, not a formality (see Step 6 risks).
+- AionUi WebUI is a local HTTP server on port 25808 (the CentaurAI Core default; override with the `--port` CLI flag — so don't hardcode it, confirm with the curl probe below). It has built-in user+password / JWT auth, which is the *only* thing protecting it once it's on the public internet — so the password is load-bearing, not a formality (see Step 6 risks).
 - There is NO HTTP/CLI way to start the desktop WebUI. Starting it is Electron-IPC only, so you cannot turn it on; you must guide the user to the toggle. You CAN detect its state, install the tunnel, run the tunnel, and verify, all yourself.
 - The tunnel tool is cloudflared (Cloudflare quick tunnel, no account needed). It must be forced to --protocol http2 (see Gotcha).
 - Password changes DO have HTTP routes you can call for the user (see "Optional: change credentials").
@@ -154,9 +154,9 @@ curl -s -X POST http://127.0.0.1:25808/api/webui/change-username -H "Content-Typ
 
 (Confirm exact field names from the response if it errors; reset-password / generate-qr-token endpoints also exist.)
 
-> These `/api/webui/*` credential endpoints only work when aioncore runs in
+> These `/api/webui/*` credential endpoints only work when CentaurAI Core runs in
 > **local mode** (the normal desktop/Electron case, which is exactly the scenario
-> this skill targets). If aioncore is deployed as a standalone server, they
+> this skill targets). If CentaurAI Core is deployed as a standalone server, they
 > return **403 Forbidden** — change the password through that deployment's own
 > mechanism instead.
 

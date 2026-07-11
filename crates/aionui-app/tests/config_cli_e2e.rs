@@ -1,4 +1,4 @@
-//! E2E coverage for the agent-facing `aioncore config` CLI.
+//! E2E coverage for the agent-facing `centaurai-core config` CLI.
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -22,7 +22,7 @@ struct Capture {
 type SharedCapture = Arc<Mutex<Option<Capture>>>;
 
 fn config_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aioncore"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_centaurai-core"));
     command.arg("config");
     command
 }
