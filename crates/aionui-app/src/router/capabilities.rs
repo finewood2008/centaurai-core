@@ -76,8 +76,11 @@ fn capabilities() -> CoreCapabilitiesResponse {
         features: BTreeMap::from([
             ("agent_management".into(), true),
             ("agent_management_refresh".into(), true),
+            ("centaurai_auth_cookies".into(), true),
             ("centaurai_environment_aliases".into(), true),
             ("centaurai_proxy_identity_headers".into(), true),
+            ("device_pairing".into(), true),
+            ("device_token_auth".into(), true),
             ("logical_model_routes".into(), true),
             ("mcp".into(), true),
             ("provider_secret_redaction".into(), true),

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -13,14 +13,17 @@ use axum::{Extension, Router};
 use serde::Deserialize;
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
-    RefreshResponse, RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    ApiResponse, AuthStatusResponse, ChangePasswordRequest, CreateDevicePairingRequest, DevicePairingSessionResponse,
+    DeviceResponse, LoginRequest, LoginResponse, PairedDeviceCredentialResponse, PublicUser, QrLoginRequest,
+    RedeemDevicePairingRequest, RefreshResponse, RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest,
+    WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse,
+    WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{DbError, IUserRepository, models::User};
 
+use crate::device::{DeviceError, DeviceService};
 use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
 use crate::middleware::{AuthState, CurrentUser, auth_middleware};
@@ -57,6 +60,40 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
     }
 }
 
+fn device_error_to_api_error(error: DeviceError) -> ApiError {
+    match error {
+        DeviceError::InvalidServerUrl => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "DEVICE_SERVER_URL_INVALID",
+            "server_url must use HTTP(S) and target a private LAN, mDNS, or Tailscale host",
+            None,
+        ),
+        DeviceError::InvalidName => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "DEVICE_NAME_INVALID",
+            "Device name is invalid",
+            None,
+        ),
+        DeviceError::InvalidPlatform => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "DEVICE_PLATFORM_INVALID",
+            "Device platform is invalid",
+            None,
+        ),
+        DeviceError::InvalidPairing => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "DEVICE_PAIRING_INVALID",
+            "Pairing code is invalid, expired, or already used",
+            None,
+        ),
+        DeviceError::NotFound => ApiError::coded(StatusCode::NOT_FOUND, "DEVICE_NOT_FOUND", "Device not found", None),
+        error @ (DeviceError::Persistence(_) | DeviceError::InvalidTimestamp) => {
+            tracing::error!(error = %error, "device service operation failed");
+            ApiError::Internal("Device service unavailable".into())
+        }
+    }
+}
+
 /// Shared state for all auth route handlers.
 #[derive(Clone)]
 pub struct AuthRouterState {
@@ -64,6 +101,8 @@ pub struct AuthRouterState {
     pub user_repo: Arc<dyn IUserRepository>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
+    pub device_service: Arc<DeviceService>,
+    pub on_device_revoked: Arc<dyn Fn(&str) + Send + Sync>,
     pub local: bool,
 }
 
@@ -103,6 +142,14 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     ))
 }
 
+fn append_set_cookies(response: &mut Response, cookies: impl IntoIterator<Item = String>) {
+    for cookie in cookies {
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+}
+
 /// Build the auth router with all endpoints and middleware layers.
 ///
 /// Returns a `Router` with these endpoints:
@@ -114,6 +161,10 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
 /// - `POST /api/auth/refresh`
 /// - `GET /api/ws-token`
 /// - `POST /api/auth/qr-login`
+/// - `GET /api/devices`
+/// - `POST /api/devices/pairing`
+/// - `POST /api/devices/pairing/redeem`
+/// - `POST /api/devices/{id}/revoke`
 /// - `GET /qr-login`
 /// - `POST /api/webui/change-password` (local-only)
 /// - `POST /api/webui/change-username` (local-only)
@@ -133,6 +184,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
+        device_service: state.device_service.clone(),
         local: false,
         proxy_identity: None,
     };
@@ -141,6 +193,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_rate_limited = Router::new()
         .route("/login", post(login_handler))
         .route("/api/auth/qr-login", post(qr_login_handler))
+        .route("/api/devices/pairing/redeem", post(redeem_device_pairing_handler))
         .route_layer(from_fn_with_state(auth_limiter, auth_rate_limit_middleware))
         .with_state(state.clone());
 
@@ -192,6 +245,9 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
         .route("/api/ws-token", get(ws_token_handler))
+        .route("/api/devices", get(list_devices_handler))
+        .route("/api/devices/pairing", post(create_device_pairing_handler))
+        .route("/api/devices/{id}/revoke", post(revoke_device_handler))
         .route_layer(from_fn_with_state(
             action_limiter.clone(),
             authenticated_action_rate_limit_middleware,
@@ -281,7 +337,7 @@ async fn login_handler(
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let cookie = state.cookie_config.build_session_cookie(&token);
+    let cookies = state.cookie_config.build_session_cookies(&token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
@@ -290,7 +346,9 @@ async fn login_handler(
         token,
     );
 
-    Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+    let mut response = Json(resp).into_response();
+    append_set_cookies(&mut response, cookies);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,14 +356,74 @@ async fn login_handler(
 // ---------------------------------------------------------------------------
 
 async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    if let Some(token) = extract_token_from_headers(&headers) {
+    if let Some(token) = extract_token_from_headers(&headers)
+        && !DeviceService::is_device_token(&token)
+    {
         state.jwt_service.blacklist_token(&token);
     }
 
-    let cookie = state.cookie_config.clear_session_cookie();
     let resp = ApiResponse::message("Logged out successfully");
+    let mut response = Json(resp).into_response();
+    append_set_cookies(&mut response, state.cookie_config.clear_session_cookies());
+    append_set_cookies(&mut response, state.cookie_config.clear_csrf_cookies());
+    Ok(response)
+}
 
-    Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+// ---------------------------------------------------------------------------
+// Device pairing and credential management
+// ---------------------------------------------------------------------------
+
+async fn create_device_pairing_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateDevicePairingRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<DevicePairingSessionResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let pairing = state
+        .device_service
+        .create_pairing(&user.id, req)
+        .await
+        .map_err(device_error_to_api_error)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(pairing))))
+}
+
+async fn redeem_device_pairing_handler(
+    State(state): State<AuthRouterState>,
+    body: Result<Json<RedeemDevicePairingRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<PairedDeviceCredentialResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let credential = state
+        .device_service
+        .redeem_pairing(req)
+        .await
+        .map_err(device_error_to_api_error)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(credential))))
+}
+
+async fn list_devices_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<DeviceResponse>>>, ApiError> {
+    let devices = state
+        .device_service
+        .list_devices(&user.id)
+        .await
+        .map_err(device_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(devices)))
+}
+
+async fn revoke_device_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<DeviceResponse>>, ApiError> {
+    let revoked = state
+        .device_service
+        .revoke_device(&user.id, &id)
+        .await
+        .map_err(device_error_to_api_error)?;
+    (state.on_device_revoked)(&revoked.token_hash);
+    Ok(Json(ApiResponse::ok(revoked.device)))
 }
 
 // ---------------------------------------------------------------------------
@@ -329,9 +447,16 @@ async fn status_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     // Check authentication without requiring it
-    let is_authenticated = extract_token_from_headers(&headers)
-        .and_then(|token| state.jwt_service.verify(&token).ok())
-        .is_some();
+    let is_authenticated = match extract_token_from_headers(&headers) {
+        Some(token) if DeviceService::is_device_token(&token) => state
+            .device_service
+            .authenticate_token(&token)
+            .await
+            .map_err(device_error_to_api_error)?
+            .is_some(),
+        Some(token) => state.jwt_service.verify(&token).is_ok(),
+        None => false,
+    };
 
     Ok(Json(AuthStatusResponse {
         success: true,
@@ -627,7 +752,7 @@ async fn qr_login_handler(
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let cookie = state.cookie_config.build_session_cookie(&token);
+    let cookies = state.cookie_config.build_session_cookies(&token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
@@ -636,7 +761,9 @@ async fn qr_login_handler(
         token,
     );
 
-    Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+    let mut response = Json(resp).into_response();
+    append_set_cookies(&mut response, cookies);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

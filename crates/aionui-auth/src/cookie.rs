@@ -1,4 +1,6 @@
-use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, COOKIE_NAME, CSRF_COOKIE_NAME};
+use aionui_common::constants::{
+    COOKIE_MAX_AGE_DAYS, COOKIE_NAME, CSRF_COOKIE_NAME, LEGACY_COOKIE_NAME, LEGACY_CSRF_COOKIE_NAME,
+};
 
 /// Cookie security configuration derived from the deployment environment.
 #[derive(Debug, Clone)]
@@ -28,9 +30,21 @@ impl CookieConfig {
     ///
     /// Attributes: HttpOnly, SameSite, Secure (if HTTPS), Max-Age=30d.
     pub fn build_session_cookie(&self, token: &str) -> String {
+        self.build_session_cookie_named(COOKIE_NAME, token)
+    }
+
+    /// Build primary and transition-only legacy session cookies.
+    pub fn build_session_cookies(&self, token: &str) -> [String; 2] {
+        [
+            self.build_session_cookie_named(COOKIE_NAME, token),
+            self.build_session_cookie_named(LEGACY_COOKIE_NAME, token),
+        ]
+    }
+
+    fn build_session_cookie_named(&self, name: &str, token: &str) -> String {
         let max_age = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
         format!(
-            "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite={}{}; Max-Age={max_age}",
+            "{name}={token}; Path=/; HttpOnly; SameSite={}{}; Max-Age={max_age}",
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -38,8 +52,20 @@ impl CookieConfig {
 
     /// Build `Set-Cookie` header value that clears the session cookie.
     pub fn clear_session_cookie(&self) -> String {
+        self.clear_session_cookie_named(COOKIE_NAME)
+    }
+
+    /// Clear primary and legacy session cookies.
+    pub fn clear_session_cookies(&self) -> [String; 2] {
+        [
+            self.clear_session_cookie_named(COOKIE_NAME),
+            self.clear_session_cookie_named(LEGACY_COOKIE_NAME),
+        ]
+    }
+
+    fn clear_session_cookie_named(&self, name: &str) -> String {
         format!(
-            "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite={}{}; Max-Age=0",
+            "{name}=; Path=/; HttpOnly; SameSite={}{}; Max-Age=0",
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -50,9 +76,37 @@ impl CookieConfig {
     /// NOT HttpOnly — JavaScript must read this value to include it
     /// in the `x-csrf-token` request header (Double Submit Cookie pattern).
     pub fn build_csrf_cookie(&self, token: &str) -> String {
+        self.build_csrf_cookie_named(CSRF_COOKIE_NAME, token)
+    }
+
+    /// Build primary and transition-only legacy CSRF cookies.
+    pub fn build_csrf_cookies(&self, token: &str) -> [String; 2] {
+        [
+            self.build_csrf_cookie_named(CSRF_COOKIE_NAME, token),
+            self.build_csrf_cookie_named(LEGACY_CSRF_COOKIE_NAME, token),
+        ]
+    }
+
+    fn build_csrf_cookie_named(&self, name: &str, token: &str) -> String {
         let max_age = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
         format!(
-            "{CSRF_COOKIE_NAME}={token}; Path=/; SameSite={}{}; Max-Age={max_age}",
+            "{name}={token}; Path=/; SameSite={}{}; Max-Age={max_age}",
+            self.same_site,
+            if self.secure { "; Secure" } else { "" },
+        )
+    }
+
+    /// Clear primary and legacy CSRF cookies.
+    pub fn clear_csrf_cookies(&self) -> [String; 2] {
+        [
+            self.clear_csrf_cookie_named(CSRF_COOKIE_NAME),
+            self.clear_csrf_cookie_named(LEGACY_CSRF_COOKIE_NAME),
+        ]
+    }
+
+    fn clear_csrf_cookie_named(&self, name: &str) -> String {
+        format!(
+            "{name}=; Path=/; SameSite={}{}; Max-Age=0",
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -80,7 +134,7 @@ mod tests {
     #[test]
     fn session_cookie_http() {
         let cookie = http_config().build_session_cookie("my_token");
-        assert!(cookie.contains("aionui-session=my_token"));
+        assert!(cookie.contains("centaurai-session=my_token"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
         assert!(cookie.contains("Path=/"));
@@ -98,7 +152,7 @@ mod tests {
     #[test]
     fn clear_session_cookie_sets_max_age_zero() {
         let cookie = http_config().clear_session_cookie();
-        assert!(cookie.contains("aionui-session="));
+        assert!(cookie.contains("centaurai-session="));
         assert!(cookie.contains("Max-Age=0"));
         assert!(cookie.contains("HttpOnly"));
     }
@@ -106,7 +160,7 @@ mod tests {
     #[test]
     fn csrf_cookie_not_http_only() {
         let cookie = http_config().build_csrf_cookie("csrf_abc");
-        assert!(cookie.contains("aionui-csrf-token=csrf_abc"));
+        assert!(cookie.contains("centaurai-csrf-token=csrf_abc"));
         assert!(!cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
         assert!(cookie.contains("Max-Age="));
@@ -124,5 +178,28 @@ mod tests {
         let cookie = http_config().build_session_cookie("t");
         let expected = 30 * 24 * 60 * 60;
         assert!(cookie.contains(&format!("Max-Age={expected}")));
+    }
+
+    #[test]
+    fn transition_cookie_sets_cover_primary_and_legacy_names() {
+        let session = http_config().build_session_cookies("token");
+        assert!(session[0].starts_with("centaurai-session=token;"));
+        assert!(session[1].starts_with("aionui-session=token;"));
+
+        let csrf = http_config().build_csrf_cookies("csrf");
+        assert!(csrf[0].starts_with("centaurai-csrf-token=csrf;"));
+        assert!(csrf[1].starts_with("aionui-csrf-token=csrf;"));
+    }
+
+    #[test]
+    fn transition_clear_cookies_cover_both_namespaces() {
+        let session = http_config().clear_session_cookies();
+        let csrf = http_config().clear_csrf_cookies();
+        assert!(session.iter().all(|cookie| cookie.contains("Max-Age=0")));
+        assert!(csrf.iter().all(|cookie| cookie.contains("Max-Age=0")));
+        assert!(session[0].starts_with("centaurai-session="));
+        assert!(session[1].starts_with("aionui-session="));
+        assert!(csrf[0].starts_with("centaurai-csrf-token="));
+        assert!(csrf[1].starts_with("aionui-csrf-token="));
     }
 }

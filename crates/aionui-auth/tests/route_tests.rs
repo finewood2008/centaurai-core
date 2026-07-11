@@ -12,8 +12,8 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_auth::{AuthRouterState, CookieConfig, JwtService, QrTokenStore, auth_routes, hash_password};
-use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+use aionui_auth::{AuthRouterState, CookieConfig, DeviceService, JwtService, QrTokenStore, auth_routes, hash_password};
+use aionui_db::{IUserRepository, SqliteDeviceRepository, SqliteUserRepository, init_database_memory};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -33,12 +33,17 @@ async fn test_app_with_local(local: bool) -> (Router, TestContext) {
         same_site: "Lax",
     });
     let qr_token_store = Arc::new(QrTokenStore::new());
+    let device_service = Arc::new(DeviceService::new(Arc::new(SqliteDeviceRepository::new(
+        db.pool().clone(),
+    ))));
 
     let state = AuthRouterState {
         jwt_service: jwt_service.clone(),
         user_repo: user_repo.clone(),
         cookie_config,
         qr_token_store: qr_token_store.clone(),
+        device_service: device_service.clone(),
+        on_device_revoked: Arc::new(|_| {}),
         local,
     };
 
@@ -47,7 +52,7 @@ async fn test_app_with_local(local: bool) -> (Router, TestContext) {
         jwt_service,
         user_repo,
         qr_token_store,
-        _db: db,
+        db,
     };
     (app, ctx)
 }
@@ -57,7 +62,7 @@ struct TestContext {
     jwt_service: Arc<JwtService>,
     user_repo: Arc<dyn IUserRepository>,
     qr_token_store: Arc<QrTokenStore>,
-    _db: aionui_db::Database,
+    db: aionui_db::Database,
 }
 
 /// Helper: create a test user with known credentials.
@@ -138,6 +143,15 @@ fn json_post_anonymous(uri: &str, body: &str) -> Request<Body> {
     json_post(uri, body)
 }
 
+fn pairing_code(pairing_uri: &str) -> String {
+    url::Url::parse(pairing_uri)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap()
+}
+
 // ===========================================================================
 // T4. Login (POST /login)
 // ===========================================================================
@@ -153,9 +167,19 @@ async fn t4_1_login_success() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Check Set-Cookie header
-    let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie.contains("aionui-session="));
-    assert!(set_cookie.contains("HttpOnly"));
+    let set_cookies: Vec<_> = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("centaurai-session="))
+    );
+    assert!(set_cookies.iter().any(|cookie| cookie.starts_with("aionui-session=")));
+    assert!(set_cookies.iter().all(|cookie| cookie.contains("HttpOnly")));
 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
@@ -270,8 +294,30 @@ async fn t5_1_logout_success() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Cookie should be cleared
-    let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie.contains("Max-Age=0"));
+    let set_cookies: Vec<_> = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(set_cookies.len(), 4);
+    assert!(set_cookies.iter().all(|cookie| cookie.contains("Max-Age=0")));
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("centaurai-session="))
+    );
+    assert!(set_cookies.iter().any(|cookie| cookie.starts_with("aionui-session=")));
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("centaurai-csrf-token="))
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("aionui-csrf-token="))
+    );
 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
@@ -640,8 +686,18 @@ async fn t11_1_qr_login_success() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Check Set-Cookie
-    let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie.contains("aionui-session="));
+    let set_cookies: Vec<_> = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("centaurai-session="))
+    );
+    assert!(set_cookies.iter().any(|cookie| cookie.starts_with("aionui-session=")));
 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
@@ -659,6 +715,310 @@ async fn t11_2_qr_login_invalid_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+// ===========================================================================
+// Device pairing and credential management
+// ===========================================================================
+
+#[tokio::test]
+async fn device_pairing_roundtrip_persists_only_hashes_and_revocation_is_immediate() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (owner_token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+
+    let response = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/devices/pairing",
+            r#"{"server_url":"https://context.home.local"}"#,
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let pairing = body_json(response).await;
+    let pairing_id = pairing["data"]["id"].as_str().unwrap();
+    let uri = pairing["data"]["pairing_uri"].as_str().unwrap();
+    assert!(uri.starts_with("contextofme://pair?"));
+    assert!(!uri.contains("device_token"));
+    assert!(pairing["data"]["expires_at"].as_str().unwrap().ends_with('Z'));
+    let code = pairing_code(uri);
+
+    let stored_code_hash: String = sqlx::query_scalar("SELECT code_hash FROM device_pairing_sessions WHERE id = ?")
+        .bind(pairing_id)
+        .fetch_one(ctx.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored_code_hash.len(), 64);
+    assert_ne!(stored_code_hash, code);
+
+    let response = app
+        .clone()
+        .oneshot(json_post_anonymous(
+            "/api/devices/pairing/redeem",
+            &serde_json::json!({"code": code, "name": "Phone", "platform": "ios"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let credential = body_json(response).await;
+    let device_id = credential["data"]["device"]["id"].as_str().unwrap().to_owned();
+    let device_token = credential["data"]["device_token"].as_str().unwrap().to_owned();
+    assert!(device_token.starts_with("cai_dev_v1_"));
+    let serialized = serde_json::to_string(&credential).unwrap();
+    assert!(!serialized.contains("token_hash"));
+    assert!(!serialized.contains("code_hash"));
+
+    let stored_token_hash: String = sqlx::query_scalar("SELECT token_hash FROM devices WHERE id = ?")
+        .bind(&device_id)
+        .fetch_one(ctx.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored_token_hash.len(), 64);
+    assert_ne!(stored_token_hash, device_token);
+    let consumed_at: Option<i64> = sqlx::query_scalar("SELECT consumed_at FROM device_pairing_sessions WHERE id = ?")
+        .bind(pairing_id)
+        .fetch_one(ctx.db.pool())
+        .await
+        .unwrap();
+    assert!(consumed_at.is_some());
+
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('devices')")
+        .fetch_all(ctx.db.pool())
+        .await
+        .unwrap();
+    assert!(!columns.iter().any(|name| name == "device_token" || name == "token"));
+    let pairing_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('device_pairing_sessions')")
+            .fetch_all(ctx.db.pool())
+            .await
+            .unwrap();
+    assert!(
+        !pairing_columns
+            .iter()
+            .any(|name| name == "code" || name == "pairing_code")
+    );
+
+    let replay = app
+        .clone()
+        .oneshot(json_post_anonymous(
+            "/api/devices/pairing/redeem",
+            &serde_json::json!({"code": code, "name": "Replay", "platform": "ios"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_json = body_json(replay).await;
+    assert_eq!(replay_json["code"], "DEVICE_PAIRING_INVALID");
+    assert!(!serde_json::to_string(&replay_json).unwrap().contains(&code));
+
+    let listed = app
+        .clone()
+        .oneshot(get_with_token("/api/devices", &device_token))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_json = body_json(listed).await;
+    assert_eq!(listed_json["data"].as_array().unwrap().len(), 1);
+    assert!(listed_json["data"][0].get("token_hash").is_none());
+    assert!(listed_json["data"][0].get("device_token").is_none());
+
+    let revoked = app
+        .clone()
+        .oneshot(json_post_with_token(
+            &format!("/api/devices/{device_id}/revoke"),
+            "{}",
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let revoked_json = body_json(revoked).await;
+    assert!(revoked_json["data"]["revoked_at"].as_str().unwrap().ends_with('Z'));
+    assert!(revoked_json["data"].get("token_hash").is_none());
+
+    let rejected = app
+        .oneshot(get_with_token("/api/devices", &device_token))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(rejected).await["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn device_pairing_rejects_public_server_urls() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let response = app
+        .oneshot(json_post_with_token(
+            "/api/devices/pairing",
+            r#"{"server_url":"https://example.com"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "DEVICE_SERVER_URL_INVALID");
+}
+
+#[tokio::test]
+async fn expired_device_pairing_is_rejected_without_leaking_code() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let pairing = body_json(
+        app.clone()
+            .oneshot(json_post_with_token(
+                "/api/devices/pairing",
+                r#"{"server_url":"http://192.168.1.20:25808"}"#,
+                &token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let pairing_id = pairing["data"]["id"].as_str().unwrap();
+    let code = pairing_code(pairing["data"]["pairing_uri"].as_str().unwrap());
+    sqlx::query("UPDATE device_pairing_sessions SET expires_at = 0 WHERE id = ?")
+        .bind(pairing_id)
+        .execute(ctx.db.pool())
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_post_anonymous(
+            "/api/devices/pairing/redeem",
+            &serde_json::json!({"code": code, "name": "Phone", "platform": "ios"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert_eq!(json["code"], "DEVICE_PAIRING_INVALID");
+    assert!(!serde_json::to_string(&json).unwrap().contains(&code));
+}
+
+#[tokio::test]
+async fn concurrent_device_pairing_redemption_has_one_success() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let pairing = body_json(
+        app.clone()
+            .oneshot(json_post_with_token(
+                "/api/devices/pairing",
+                r#"{"server_url":"http://centaur-server:25808"}"#,
+                &token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let code = pairing_code(pairing["data"]["pairing_uri"].as_str().unwrap());
+    let first = json_post_anonymous(
+        "/api/devices/pairing/redeem",
+        &serde_json::json!({"code": code, "name": "Phone A", "platform": "ios"}).to_string(),
+    );
+    let second = json_post_anonymous(
+        "/api/devices/pairing/redeem",
+        &serde_json::json!({"code": code, "name": "Phone B", "platform": "android"}).to_string(),
+    );
+    let (first, second) = tokio::join!(app.clone().oneshot(first), app.clone().oneshot(second));
+    let statuses = [first.unwrap().status(), second.unwrap().status()];
+    assert_eq!(
+        statuses.iter().filter(|status| **status == StatusCode::CREATED).count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::BAD_REQUEST)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn devices_are_isolated_across_users() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    create_test_user(&ctx, "bob", "AnotherP@ss1").await;
+    let (owner_token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let (other_token, _) = login(&mut app, "bob", "AnotherP@ss1").await;
+
+    let pairing = body_json(
+        app.clone()
+            .oneshot(json_post_with_token(
+                "/api/devices/pairing",
+                r#"{"server_url":"http://127.0.0.1:25808"}"#,
+                &owner_token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let code = pairing_code(pairing["data"]["pairing_uri"].as_str().unwrap());
+    let paired = body_json(
+        app.clone()
+            .oneshot(json_post_anonymous(
+                "/api/devices/pairing/redeem",
+                &serde_json::json!({"code": code, "name": "Owner Phone", "platform": "ios"}).to_string(),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let device_id = paired["data"]["device"]["id"].as_str().unwrap();
+
+    let other_list = app
+        .clone()
+        .oneshot(get_with_token("/api/devices", &other_token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(other_list).await["data"], serde_json::json!([]));
+
+    let other_revoke = app
+        .oneshot(json_post_with_token(
+            &format!("/api/devices/{device_id}/revoke"),
+            "{}",
+            &other_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_revoke.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(other_revoke).await["code"], "DEVICE_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn device_routes_require_auth_and_pairing_redeem_is_rate_limited() {
+    let (app, _ctx) = test_app().await;
+    let unauthorized = app.clone().oneshot(get_anonymous("/api/devices")).await.unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let fake_code = format!("cai_pair_v1_{}", "A".repeat(43));
+    for _ in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(json_post_anonymous(
+                "/api/devices/pairing/redeem",
+                &serde_json::json!({"code": fake_code, "name": "Phone", "platform": "ios"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "DEVICE_PAIRING_INVALID");
+    }
+    let limited = app
+        .oneshot(json_post_anonymous(
+            "/api/devices/pairing/redeem",
+            &serde_json::json!({"code": fake_code, "name": "Phone", "platform": "ios"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body_json(limited).await["code"], "RATE_LIMITED");
 }
 
 #[tokio::test]

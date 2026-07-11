@@ -10,7 +10,7 @@ use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, Re
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
-use aionui_auth::{ProxyIdentityVerifier, extract_token_from_ws_headers};
+use aionui_auth::{DeviceService, ProxyIdentityVerifier, extract_token_from_ws_headers};
 use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
@@ -852,16 +852,31 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     }
 
     let jwt_service = services.jwt_service.clone();
+    let device_service = services.device_service.clone();
     let user_repo = services.user_repo.clone();
     let token_validator_service = jwt_service.clone();
-    let token_validator = Arc::new(move |token: &str| token_validator_service.verify(token).is_ok());
+    let token_validator = Arc::new(move |token: &str| {
+        token_validator_service.verify(token).is_ok() || DeviceService::is_device_token(token)
+    });
     let identity_resolver: aionui_realtime::ConnectionIdentityResolver =
         Arc::new(move |_: axum::http::HeaderMap, token: String| {
             let jwt_service = jwt_service.clone();
+            let device_service = device_service.clone();
             let user_repo = user_repo.clone();
             Box::pin(async move {
-                let payload = jwt_service.verify(&token).ok()?;
-                let user = user_repo.find_by_id(&payload.user_id).await.ok()??;
+                let user_id = if DeviceService::is_device_token(&token) {
+                    match device_service.authenticate_token(&token).await {
+                        Ok(Some(principal)) => principal.user_id,
+                        Ok(None) => return None,
+                        Err(error) => {
+                            tracing::error!(error = %error, "websocket device authentication lookup failed");
+                            return None;
+                        }
+                    }
+                } else {
+                    jwt_service.verify(&token).ok()?.user_id
+                };
+                let user = user_repo.find_by_id(&user_id).await.ok()??;
                 Some(RealtimeIdentity {
                     is_admin: user.id == "system_default_user",
                     user_id: user.id,

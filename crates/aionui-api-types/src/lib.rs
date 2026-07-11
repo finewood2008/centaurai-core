@@ -15,6 +15,7 @@ mod conversation;
 mod core_capabilities;
 mod cron;
 mod custom_agent;
+mod device;
 mod extension;
 mod file;
 mod lifecycle;
@@ -97,6 +98,10 @@ pub use cron::{
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
+};
+pub use device::{
+    CreateDevicePairingRequest, DevicePairingSessionResponse, DeviceResponse, PairedDeviceCredentialResponse,
+    RedeemDevicePairingRequest,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,

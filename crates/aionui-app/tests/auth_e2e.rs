@@ -33,9 +33,9 @@ fn extract_csrf_token(resp: &axum::response::Response) -> Option<String> {
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|s| s.starts_with("aionui-csrf-token="))
+        .find(|s| s.starts_with("centaurai-csrf-token="))
         .map(|s| {
-            s.strip_prefix("aionui-csrf-token=")
+            s.strip_prefix("centaurai-csrf-token=")
                 .unwrap()
                 .split(';')
                 .next()
@@ -50,9 +50,9 @@ fn extract_session_token(resp: &axum::response::Response) -> Option<String> {
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|s| s.starts_with("aionui-session="))
+        .find(|s| s.starts_with("centaurai-session="))
         .and_then(|s| {
-            let value = s.strip_prefix("aionui-session=")?.split(';').next()?.to_owned();
+            let value = s.strip_prefix("centaurai-session=")?.split(';').next()?.to_owned();
             if value.is_empty() { None } else { Some(value) }
         })
 }
@@ -71,6 +71,15 @@ fn get_with_token(uri: &str, token: &str) -> Request<Body> {
 }
 
 fn get_with_cookie(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("cookie", format!("centaurai-session={token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn get_with_legacy_cookie(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri(uri)
@@ -93,9 +102,11 @@ fn post_json_with_csrf(uri: &str, body: &str, token: &str, csrf: &str) -> Reques
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
         .header("x-csrf-token", csrf)
-        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .header(
+            "cookie",
+            format!("centaurai-session={token}; centaurai-csrf-token={csrf}"),
+        )
         .body(Body::from(body.to_owned()))
         .unwrap()
 }
@@ -168,15 +179,19 @@ async fn t12_1_security_headers_on_error_responses() {
 }
 
 #[tokio::test]
-async fn t12_2_csrf_blocks_post_without_token() {
+async fn t12_2_csrf_blocks_cross_origin_cookie_post_without_double_submit() {
     let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // POST /logout without CSRF token → 403
+    // A browser-style cookie request without the matching header is rejected.
     let req = Request::builder()
         .method("POST")
         .uri("/logout")
-        .header("authorization", format!("Bearer {token}"))
+        .header(
+            "cookie",
+            format!("centaurai-session={token}; centaurai-csrf-token={csrf}"),
+        )
+        .header("origin", "https://attacker.example")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -187,6 +202,33 @@ async fn t12_2_csrf_blocks_post_without_token() {
         json["error"].as_str().unwrap_or("").contains("CSRF"),
         "error message should mention CSRF"
     );
+}
+
+#[tokio::test]
+async fn t12_2_pure_bearer_post_requires_auth_but_not_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let valid = Request::builder()
+        .method("POST")
+        .uri("/logout")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", "https://native-client.invalid")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(valid).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let forged = Request::builder()
+        .method("POST")
+        .uri("/logout")
+        .header("authorization", "Bearer forged")
+        .header("origin", "https://attacker.example")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(forged).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -233,13 +275,17 @@ async fn t12_3_session_cookie_attributes() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let set_cookie = resp
+    let set_cookies: Vec<_> = resp
         .headers()
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|s| s.starts_with("aionui-session="))
-        .expect("session cookie should be set");
+        .collect();
+    let set_cookie = set_cookies
+        .iter()
+        .find(|cookie| cookie.starts_with("centaurai-session="))
+        .expect("canonical session cookie should be set");
+    assert!(set_cookies.iter().any(|cookie| cookie.starts_with("aionui-session=")));
 
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite="));
@@ -285,6 +331,33 @@ async fn t13_2_cookie_fallback() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["user"]["username"], "admin");
+}
+
+#[tokio::test]
+async fn t13_2_legacy_cookie_fallback_remains_isolated_compatibility() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let response = app
+        .oneshot(get_with_legacy_cookie("/api/auth/user", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["user"]["username"], "admin");
+}
+
+#[tokio::test]
+async fn t13_2_canonical_cookie_does_not_downgrade_to_conflicting_legacy_cookie() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/auth/user")
+        .header("cookie", format!("centaurai-session=forged; aionui-session={token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -423,6 +496,18 @@ async fn full_auth_flow_e2e() {
     let req = post_json_with_csrf("/logout", "", &new_token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let cleared: Vec<_> = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(cleared.len(), 4);
+    assert!(cleared.iter().all(|cookie| cookie.contains("Max-Age=0")));
+    assert!(cleared.iter().any(|cookie| cookie.starts_with("centaurai-session=")));
+    assert!(cleared.iter().any(|cookie| cookie.starts_with("aionui-session=")));
+    assert!(cleared.iter().any(|cookie| cookie.starts_with("centaurai-csrf-token=")));
+    assert!(cleared.iter().any(|cookie| cookie.starts_with("aionui-csrf-token=")));
 
     // 9. Token invalid after logout
     let req = get_with_token("/api/auth/user", &new_token);
@@ -446,4 +531,11 @@ async fn csrf_cookie_set_on_first_get() {
     let csrf = extract_csrf_token(&resp);
     assert!(csrf.is_some(), "CSRF cookie should be set on first request");
     assert_eq!(csrf.unwrap().len(), 64, "CSRF token should be 64 hex chars");
+    assert!(
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|cookie| cookie.starts_with("aionui-csrf-token="))
+    );
 }
