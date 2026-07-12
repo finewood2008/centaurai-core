@@ -49,7 +49,7 @@ impl PlatformSpec {
 #[derive(Debug, Clone)]
 struct ManagedNodeDownloadSource {
     url: String,
-    sha256: Option<String>,
+    sha256: &'static str,
     source: &'static str,
 }
 
@@ -504,13 +504,11 @@ async fn install_archive(
         .error_for_status()
         .map_err(|error| reqwest_error("download archive", &url, &error))?;
     stream_archive_to_file(response, &archive_path, &url, reporter).await?;
-    if let Some(expected_sha256) = download_source.sha256.as_deref() {
-        emit_progress(
-            reporter,
-            NodeRuntimeProgress::validating("verifying managed Node artifact checksum".to_owned()),
-        );
-        verify_archive_checksum(&archive_path, expected_sha256)?;
-    }
+    emit_progress(
+        reporter,
+        NodeRuntimeProgress::validating("verifying managed Node artifact checksum".to_owned()),
+    );
+    verify_archive_checksum(&archive_path, download_source.sha256)?;
 
     emit_progress(
         reporter,
@@ -552,9 +550,18 @@ fn verify_archive_checksum(path: &Path, expected_sha256: &str) -> Result<(), Nod
 
 impl ManagedNodeDownloadSource {
     fn official(spec: PlatformSpec) -> Self {
+        let sha256 = match (spec.folder_suffix, spec.archive_ext) {
+            ("darwin-arm64", "tar.gz") => "0be2ab2816a4fa02d1acff014a434f29f56d8d956f5af6a98b70ced6c5f4d201",
+            ("darwin-x64", "tar.gz") => "3884671e87f46f773832d98a0a6cabcc5ec4f637084f0f3515b69e66ea27f2f1",
+            ("linux-arm64", "tar.gz") => "4786d00c4d259d3ff0b2328307f764ef3ced65f2d6e9502d433e68d66238509d",
+            ("linux-x64", "tar.gz") => "b3c071cdf47aab867c3b2aa287257df12ec5d7c962bf922b32fd33226c4295fd",
+            ("win-arm64", "zip") => "12d3b1aa9696b7411e115a4fa2aef57f95560b5ee16bb62cd69843e535ec72be",
+            ("win-x64", "zip") => "1054540bce22b54ec7e50ebc078ec5d090700a77657607a58f6a64df21f49fdd",
+            _ => panic!("missing official Node checksum for {}", spec.directory_name()),
+        };
         Self {
             url: spec.official_download_url(),
-            sha256: None,
+            sha256,
             source: "nodejs.org",
         }
     }

@@ -157,6 +157,7 @@ impl WorkerClient {
         content_type: HeaderValue,
         content_length: Option<HeaderValue>,
         body: Body,
+        idempotency: Option<(&str, &str)>,
     ) -> Result<T, KnowledgeError>
     where
         T: DeserializeOwned,
@@ -171,6 +172,11 @@ impl WorkerClient {
             .body(reqwest::Body::wrap_stream(stream));
         if let Some(content_length) = content_length {
             request = request.header(CONTENT_LENGTH, content_length);
+        }
+        if let Some((operation_key, request_fingerprint)) = idempotency {
+            request = request
+                .header("idempotency-key", operation_key)
+                .header("x-centaurai-request-fingerprint", request_fingerprint);
         }
         let response = request.send().await.map_err(map_transport_error)?;
         decode_response(response).await

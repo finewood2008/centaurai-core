@@ -141,6 +141,58 @@ async fn auto_enrichment_degrades_without_cloud_permission_but_required_does_not
 }
 
 #[tokio::test]
+async fn local_preflight_persists_explicit_cloud_consent_for_later_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/knowledge/spaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            "id": "personal",
+            "name": "Personal",
+            "description": "",
+            "cloud_use": "allowed",
+            "created_at": "2026-07-12T00:00:00Z",
+            "updated_at": "2026-07-12T00:00:00Z"
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/knowledge/search"))
+        .and(body_json(serde_json::json!({
+            "query": "launch plan",
+            "mode": "hybrid",
+            "space_ids": ["personal"],
+            "max_hits": 8,
+            "cloud_use": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(valid_search_response()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gateway = gateway(&server, ModelLocation::Local).await;
+    let mut request = SendMessageRequest {
+        content: "launch plan".into(),
+        files: vec![],
+        inject_skills: vec![],
+        hidden: false,
+        knowledge: Some(SendMessageKnowledge {
+            mode: SendMessageKnowledgeMode::Auto,
+            space_ids: vec!["personal".into()],
+            max_hits: 8,
+            cloud_use: true,
+        }),
+        retrieval: None,
+    };
+
+    gateway
+        .enrich_message("owner", "conversation", &mut request)
+        .await
+        .unwrap();
+
+    assert!(request.retrieval.unwrap().cloud_authorized);
+}
+
+#[tokio::test]
 async fn worker_failure_is_sanitized_and_required_empty_search_is_explicit() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

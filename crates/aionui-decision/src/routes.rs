@@ -11,7 +11,7 @@ use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 
 use crate::{DecisionError, DecisionService};
@@ -37,11 +37,30 @@ pub fn decision_routes(state: DecisionRouterState) -> Router {
 async fn create_decision(
     State(state): State<DecisionRouterState>,
     Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
     body: Result<Json<CreateDecisionRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<DecisionResponse>>), ApiError> {
     let Json(request) = body.map_err(ApiError::from)?;
-    let response = state.service.create(&user.id, request).await?;
+    let operation_id = header_value(&headers, "idempotency-key")?;
+    let response = state
+        .service
+        .create_with_idempotency(&user.id, request, operation_id)
+        .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ApiError> {
+    if headers.get_all(name).iter().count() > 1 {
+        return Err(ApiError::BadRequest(format!("{name} must be supplied once")));
+    }
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::BadRequest(format!("{name} must contain visible ASCII")))
+        })
+        .transpose()
 }
 
 async fn list_decisions(

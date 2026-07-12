@@ -122,7 +122,30 @@ fn managed_runtime_official_source_uses_nodejs_org() {
         source.url,
         "https://nodejs.org/dist/v24.11.0/node-v24.11.0-darwin-arm64.tar.gz"
     );
-    assert_eq!(source.sha256, None);
+    assert_eq!(
+        source.sha256,
+        "0be2ab2816a4fa02d1acff014a434f29f56d8d956f5af6a98b70ced6c5f4d201"
+    );
+}
+
+#[test]
+fn managed_runtime_all_release_platforms_have_pinned_official_checksums() {
+    let expected = [
+        ("darwin-arm64", "tar.gz"),
+        ("darwin-x64", "tar.gz"),
+        ("linux-arm64", "tar.gz"),
+        ("linux-x64", "tar.gz"),
+        ("win-arm64", "zip"),
+        ("win-x64", "zip"),
+    ];
+    for (folder_suffix, archive_ext) in expected {
+        let source = ManagedNodeDownloadSource::official(PlatformSpec {
+            folder_suffix,
+            archive_ext,
+        });
+        assert_eq!(source.sha256.len(), 64, "{folder_suffix}");
+        assert!(source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 }
 
 #[test]

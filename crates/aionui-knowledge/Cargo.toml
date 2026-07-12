@@ -7,20 +7,27 @@ license.workspace = true
 
 [dependencies]
 aionui-api-types.workspace = true
+aionui-auth.workspace = true
 aionui-common.workspace = true
 aionui-runtime.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+multer.workspace = true
+hex.workspace = true
 httpdate.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+aionui-db.workspace = true
 http-body-util.workspace = true
 tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true

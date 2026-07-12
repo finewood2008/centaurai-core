@@ -360,7 +360,74 @@ fn remote_error(e: &reqwest::Error) -> SystemError {
 
 #[cfg(test)]
 mod tests {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn anthropic_fetcher_preserves_protocol_headers_and_response_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("x-api-key", "anthropic-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "claude-test"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let models = fetch_anthropic(&test_client(), &server.uri(), "anthropic-key")
+            .await
+            .unwrap();
+        assert_eq!(models, vec![ModelInfo::Id("claude-test".into())]);
+    }
+
+    #[tokio::test]
+    async fn gemini_fetcher_preserves_key_query_and_response_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .and(query_param("key", "gemini-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "models/gemini-test"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let models = fetch_gemini(&test_client(), &server.uri(), "gemini-key").await.unwrap();
+        assert_eq!(models, vec![ModelInfo::Id("gemini-test".into())]);
+    }
+
+    #[tokio::test]
+    async fn new_api_fetcher_enforces_v1_and_bearer_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer tokenclub-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "model-a"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let models = fetch_new_api(&test_client(), &server.uri(), "tokenclub-key")
+            .await
+            .unwrap();
+        assert_eq!(models, vec![ModelInfo::Id("model-a".into())]);
+    }
 
     #[test]
     fn ensure_v1_path_already_present() {

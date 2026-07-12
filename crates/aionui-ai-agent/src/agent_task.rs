@@ -21,6 +21,7 @@ use crate::manager::acp::AcpAgentManager;
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
+use crate::types::ModelEgressSnapshot;
 use crate::types::SendMessageData;
 
 use aionui_api_types::{
@@ -86,6 +87,10 @@ pub trait IAgentTask: Send + Sync {
 #[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 pub trait IMockAgent: IAgentTask {
+    fn model_egress_snapshot(&self) -> ModelEgressSnapshot {
+        ModelEgressSnapshot::default()
+    }
+
     fn get_confirmations(&self) -> Vec<Confirmation> {
         Vec::new()
     }
@@ -183,6 +188,18 @@ impl AgentInstance {
     /// The type of agent this instance controls.
     pub fn agent_type(&self) -> AgentType {
         self.as_task().agent_type()
+    }
+
+    /// Snapshot of the transport that will receive the next model attempt.
+    /// ACP agents are conservatively external because their CLI owns the
+    /// provider connection and Core cannot prove it is loopback-only.
+    pub fn model_egress_snapshot(&self) -> ModelEgressSnapshot {
+        match self {
+            Self::Acp(_) => ModelEgressSnapshot::external(),
+            Self::Aionrs(manager) => manager.model_egress_snapshot().clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(manager) => manager.model_egress_snapshot(),
+        }
     }
 
     /// Conversation ID this task is bound to.
@@ -519,6 +536,7 @@ mod aionrs_config_option_tests {
 
     fn make_test_config() -> AionrsResolvedConfig {
         AionrsResolvedConfig {
+            model_egress: Default::default(),
             provider: "anthropic".into(),
             api_key: "sk-test-key".into(),
             model: "claude-sonnet-4-20250514".into(),

@@ -72,11 +72,11 @@ pub(super) async fn get_capabilities() -> Json<ApiResponse<CoreCapabilitiesRespo
 fn capabilities() -> CoreCapabilitiesResponse {
     CoreCapabilitiesResponse {
         contract: CoreContractVersions {
-            rest: "1".into(),
-            websocket: "1".into(),
+            rest: "2".into(),
+            websocket: "2".into(),
             startup: "2".into(),
         },
-        feature_version: "1".into(),
+        feature_version: "2".into(),
         features: BTreeMap::from([
             ("agent_management".into(), true),
             ("agent_management_refresh".into(), true),
@@ -84,19 +84,24 @@ fn capabilities() -> CoreCapabilitiesResponse {
             ("centaurai_environment_aliases".into(), true),
             ("centaurai_proxy_identity_headers".into(), true),
             ("decisions".into(), true),
+            ("decision_per_brain_knowledge_egress".into(), true),
+            ("idempotent_resource_creation".into(), true),
             ("device_pairing".into(), true),
             ("device_token_auth".into(), true),
             ("logical_model_routes".into(), true),
             ("knowledge_gateway".into(), true),
+            ("knowledge_dispatch_egress_gate".into(), true),
             ("knowledge_message_retrieval".into(), true),
             ("knowledge_source_content".into(), true),
+            ("knowledge_upload_idempotency_v2".into(), true),
             ("knowledge_worker_supervision".into(), true),
             ("mcp".into(), true),
             ("provider_secret_redaction".into(), true),
+            ("provider_ssrf_pinned_dns".into(), true),
             ("teams".into(), true),
         ]),
         websocket: CoreWebSocketCapabilities {
-            version: "1".into(),
+            version: "2".into(),
             events: WEBSOCKET_EVENTS.iter().map(|event| (*event).into()).collect(),
         },
     }
@@ -125,13 +130,15 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["success"], true);
-        assert_eq!(body["data"]["contract"]["rest"], "1");
+        assert_eq!(body["data"]["contract"]["rest"], "2");
+        assert_eq!(body["data"]["contract"]["websocket"], "2");
+        assert_eq!(body["data"]["feature_version"], "2");
         assert_eq!(body["data"]["features"]["agent_management_refresh"], true);
         assert_eq!(body["data"]["features"]["decisions"], true);
         assert_eq!(body["data"]["features"]["device_pairing"], true);
         assert_eq!(body["data"]["features"]["knowledge_gateway"], true);
         assert_eq!(body["data"]["features"]["knowledge_source_content"], true);
-        assert_eq!(body["data"]["websocket"]["version"], "1");
+        assert_eq!(body["data"]["websocket"]["version"], "2");
         assert!(
             body["data"]["websocket"]["events"]
                 .as_array()

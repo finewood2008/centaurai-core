@@ -14,12 +14,12 @@ pub struct CookieConfig {
 impl CookieConfig {
     /// Create cookie config from environment variables.
     ///
-    /// - `AIONUI_HTTPS=true` → Secure flag, SameSite=Strict
+    /// - `CENTAURAI_CORE_HTTPS=true` → Secure flag, SameSite=Strict
+    /// - `AIONUI_HTTPS` remains a transition-only alias when the canonical
+    ///   variable is absent.
     /// - Otherwise → no Secure flag, SameSite=Lax (for remote HTTP access)
     pub fn from_env() -> Self {
-        let https = std::env::var("AIONUI_HTTPS")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let https = https_enabled(|name| std::env::var(name).ok());
         Self {
             secure: https,
             same_site: if https { "Strict" } else { "Lax" },
@@ -113,6 +113,12 @@ impl CookieConfig {
     }
 }
 
+fn https_enabled(mut value: impl FnMut(&str) -> Option<String>) -> bool {
+    value("CENTAURAI_CORE_HTTPS")
+        .or_else(|| value("AIONUI_HTTPS"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +135,21 @@ mod tests {
             secure: true,
             same_site: "Strict",
         }
+    }
+
+    #[test]
+    fn canonical_https_environment_takes_precedence_over_legacy_alias() {
+        assert!(https_enabled(|name| match name {
+            "CENTAURAI_CORE_HTTPS" => Some("true".into()),
+            "AIONUI_HTTPS" => Some("false".into()),
+            _ => None,
+        }));
+        assert!(!https_enabled(|name| match name {
+            "CENTAURAI_CORE_HTTPS" => Some("false".into()),
+            "AIONUI_HTTPS" => Some("true".into()),
+            _ => None,
+        }));
+        assert!(https_enabled(|name| (name == "AIONUI_HTTPS").then(|| "TRUE".into())));
     }
 
     #[test]

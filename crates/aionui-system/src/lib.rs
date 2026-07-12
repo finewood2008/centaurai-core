@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod model_fetcher;
 pub mod model_route;
+mod outbound_http;
 pub mod protocol;
 pub mod provider;
 pub mod routes;

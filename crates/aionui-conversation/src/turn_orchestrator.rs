@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+use aionui_ai_agent::types::{BuildTaskOptions, ModelEgressLocation, ModelEgressSnapshot, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager};
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
@@ -16,7 +16,7 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
-use aionui_api_types::SendMessageRequest;
+use aionui_api_types::{RetrievalBundle, SendMessageKnowledgeMode, SendMessageRequest};
 use aionui_knowledge::augment_model_prompt;
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
@@ -60,11 +60,92 @@ struct TurnAttemptInput {
     build_options: BuildTaskOptions,
     stored_workspace: String,
     send: SendMessageData,
+    retrieval: Option<RetrievalBundle>,
+    knowledge_mode: Option<SendMessageKnowledgeMode>,
     msg_id: String,
     allowed_skill_names: Vec<String>,
     required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnowledgeDispatchError {
+    CloudConsentRequired,
+    RequiredEvidenceUnavailable,
+}
+
+impl KnowledgeDispatchError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::CloudConsentRequired => "KNOWLEDGE_CLOUD_CONSENT_REQUIRED",
+            Self::RequiredEvidenceUnavailable => "KNOWLEDGE_NO_RESULTS",
+        }
+    }
+
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::CloudConsentRequired => {
+                "Allow the selected knowledge spaces to be used with cloud models before retrying."
+            }
+            Self::RequiredEvidenceUnavailable => "Required knowledge evidence is unavailable for this model attempt.",
+        }
+    }
+}
+
+struct KnowledgeDispatchContent {
+    content: String,
+    evidence_included: bool,
+    evidence_withheld: bool,
+}
+
+/// Apply the knowledge egress policy to the immutable provider snapshot used
+/// by the model transport. This is intentionally called after task build and
+/// again for every replay so route fallback, provider edits, and restart
+/// recovery cannot inherit a stale preflight decision.
+fn knowledge_content_for_attempt(
+    user_content: &str,
+    retrieval: Option<&RetrievalBundle>,
+    knowledge_mode: Option<SendMessageKnowledgeMode>,
+    model_egress: &ModelEgressSnapshot,
+) -> Result<KnowledgeDispatchContent, KnowledgeDispatchError> {
+    let Some(retrieval) = retrieval else {
+        if knowledge_mode == Some(SendMessageKnowledgeMode::Required) {
+            return Err(KnowledgeDispatchError::RequiredEvidenceUnavailable);
+        }
+        return Ok(KnowledgeDispatchContent {
+            content: user_content.to_owned(),
+            evidence_included: false,
+            evidence_withheld: false,
+        });
+    };
+    if retrieval.hits.is_empty() {
+        if knowledge_mode == Some(SendMessageKnowledgeMode::Required) {
+            return Err(KnowledgeDispatchError::RequiredEvidenceUnavailable);
+        }
+        return Ok(KnowledgeDispatchContent {
+            content: user_content.to_owned(),
+            evidence_included: false,
+            evidence_withheld: false,
+        });
+    }
+
+    let authorized = model_egress.location == ModelEgressLocation::Local || retrieval.cloud_authorized;
+    if authorized {
+        return Ok(KnowledgeDispatchContent {
+            content: augment_model_prompt(retrieval, user_content),
+            evidence_included: true,
+            evidence_withheld: false,
+        });
+    }
+    if knowledge_mode == Some(SendMessageKnowledgeMode::Required) {
+        return Err(KnowledgeDispatchError::CloudConsentRequired);
+    }
+    Ok(KnowledgeDispatchContent {
+        content: user_content.to_owned(),
+        evidence_included: false,
+        evidence_withheld: true,
+    })
 }
 
 struct TurnAttemptResult {
@@ -150,6 +231,50 @@ impl ConversationTurnOrchestrator {
             }
         };
 
+        let model_egress = agent.model_egress_snapshot();
+        let dispatch = match knowledge_content_for_attempt(
+            &input.send.content,
+            input.retrieval.as_ref(),
+            input.knowledge_mode,
+            &model_egress,
+        ) {
+            Ok(dispatch) => dispatch,
+            Err(blocked) => {
+                warn!(
+                    conversation_id = %input.conv_id,
+                    turn_id = %input.turn_id,
+                    model_location = ?model_egress.location,
+                    provider_resolved = model_egress.provider_id.is_some(),
+                    error_code = blocked.code(),
+                    "Knowledge evidence blocked before model dispatch"
+                );
+                let send_error = AgentSendError::from_agent_error(AgentError::forbidden(blocked.public_message()));
+                self.service
+                    .persist_and_broadcast_send_failure_tip(
+                        &input.conv_id,
+                        &input.turn_id,
+                        &send_error,
+                        Some(blocked.code()),
+                    )
+                    .await;
+                return Err(ConversationTurnResult {
+                    status: ConversationTurnStatus::Failed,
+                    error_message: Some(blocked.public_message().to_owned()),
+                });
+            }
+        };
+        if input.retrieval.is_some() {
+            info!(
+                conversation_id = %input.conv_id,
+                turn_id = %input.turn_id,
+                model_location = ?model_egress.location,
+                provider_resolved = model_egress.provider_id.is_some(),
+                evidence_included = dispatch.evidence_included,
+                evidence_withheld = dispatch.evidence_withheld,
+                "Knowledge egress policy evaluated for model attempt"
+            );
+        }
+
         if let Err(err) = self
             .service
             .maybe_persist_workspace(&input.conv_id, &input.stored_workspace, agent.workspace())
@@ -189,7 +314,9 @@ impl ConversationTurnOrchestrator {
 
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
-        let mut pending_send = Some((input.send, input.msg_id));
+        let mut initial_send = input.send;
+        initial_send.content = dispatch.content;
+        let mut pending_send = Some((initial_send, input.msg_id));
         let mut continuation_count = input.continuation_count;
         let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
         let mut last_outcome = None;
@@ -355,12 +482,8 @@ impl ConversationTurnOrchestrator {
         let runtime_state = self.service.runtime_state();
         let allowed_skill_names = input.build_options.context.skills.clone();
         let first_turn_msg_id = ConversationService::mint_msg_id();
-        let content = input.request.retrieval.as_ref().map_or_else(
-            || input.request.content.clone(),
-            |bundle| augment_model_prompt(bundle, &input.request.content),
-        );
         let initial_send = SendMessageData {
-            content,
+            content: input.request.content.clone(),
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
             files: input.request.files,
@@ -382,6 +505,8 @@ impl ConversationTurnOrchestrator {
                     build_options: input.build_options.clone(),
                     stored_workspace: input.stored_workspace.clone(),
                     send: initial_send.clone(),
+                    retrieval: input.request.retrieval.clone(),
+                    knowledge_mode: input.request.knowledge.as_ref().map(|policy| policy.mode),
                     msg_id: first_turn_msg_id.clone(),
                     allowed_skill_names: allowed_skill_names.clone(),
                     required_runtime_mode: input.required_runtime_mode.clone(),

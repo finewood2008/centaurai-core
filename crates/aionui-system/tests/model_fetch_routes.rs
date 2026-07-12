@@ -164,7 +164,7 @@ async fn fetch_models_openai_compatible_success() {
         .await;
 
     let (router, db) = setup().await;
-    let id = create_provider(&db, "openai", &mock_server.uri(), "test-api-key").await;
+    let id = create_provider(&db, "local", &mock_server.uri(), "test-api-key").await;
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
     let resp = router.oneshot(req).await.unwrap();
@@ -190,7 +190,7 @@ async fn fetch_models_persisted_multi_key_uses_first_key_in_authorization_header
         .await;
 
     let (router, db) = setup().await;
-    let id = create_provider(&db, "openai", &mock_server.uri(), "first-key\nsecond-key").await;
+    let id = create_provider(&db, "local", &mock_server.uri(), "first-key\nsecond-key").await;
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
     let resp = router.oneshot(req).await.unwrap();
@@ -210,7 +210,7 @@ async fn fetch_models_openai_remote_error() {
         .await;
 
     let (router, db) = setup().await;
-    let id = create_provider(&db, "openai", &mock_server.uri(), "test-key").await;
+    let id = create_provider(&db, "local", &mock_server.uri(), "test-key").await;
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
     let resp = router.oneshot(req).await.unwrap();
@@ -222,7 +222,7 @@ async fn fetch_models_openai_remote_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fetch_models_anthropic_success() {
+async fn fetch_models_rejects_legacy_anthropic_loopback_endpoint() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -243,16 +243,11 @@ async fn fetch_models_anthropic_success() {
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let models = json["data"]["models"].as_array().unwrap();
-    assert_eq!(models.len(), 2);
-    assert_eq!(models[0], "claude-sonnet-4-20250514");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn fetch_models_anthropic_fallback_on_error() {
+async fn fetch_models_rejects_legacy_anthropic_loopback_before_fallback() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -265,12 +260,7 @@ async fn fetch_models_anthropic_fallback_on_error() {
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let models = json["data"]["models"].as_array().unwrap();
-    // Should return fallback models
-    assert!(!models.is_empty());
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +268,7 @@ async fn fetch_models_anthropic_fallback_on_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fetch_models_gemini_success() {
+async fn fetch_models_rejects_legacy_gemini_loopback_endpoint() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1beta/models"))
@@ -296,18 +286,11 @@ async fn fetch_models_gemini_success() {
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let models = json["data"]["models"].as_array().unwrap();
-    assert_eq!(models.len(), 2);
-    // models/ prefix should be stripped
-    assert_eq!(models[0], "gemini-2.5-pro");
-    assert_eq!(models[1], "gemini-2.5-flash");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn fetch_models_gemini_fallback_on_error() {
+async fn fetch_models_rejects_legacy_gemini_loopback_before_fallback() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1beta/models"))
@@ -320,11 +303,7 @@ async fn fetch_models_gemini_fallback_on_error() {
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    let models = json["data"]["models"].as_array().unwrap();
-    assert!(!models.is_empty());
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +324,7 @@ async fn fetch_models_new_api_adds_v1() {
 
     let (router, db) = setup().await;
     // base_url without /v1
-    let id = create_provider(&db, "new-api", &mock_server.uri(), "test-key").await;
+    let id = create_provider(&db, "local", &format!("{}/v1", mock_server.uri()), "test-key").await;
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
     let resp = router.oneshot(req).await.unwrap();
@@ -380,7 +359,7 @@ async fn fetch_models_url_auto_fix_success() {
         .await;
 
     let (router, db) = setup().await;
-    let id = create_provider(&db, "openai", &mock_server.uri(), "test-key").await;
+    let id = create_provider(&db, "local", &mock_server.uri(), "test-key").await;
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": true}));
     let resp = router.oneshot(req).await.unwrap();
@@ -406,7 +385,7 @@ async fn fetch_models_url_auto_fix_not_triggered_when_success() {
         .await;
 
     let (router, db) = setup().await;
-    let id = create_provider(&db, "openai", &mock_server.uri(), "test-key").await;
+    let id = create_provider(&db, "local", &mock_server.uri(), "test-key").await;
 
     let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": true}));
     let resp = router.oneshot(req).await.unwrap();
@@ -420,7 +399,7 @@ async fn fetch_models_url_auto_fix_not_triggered_when_success() {
 }
 
 #[tokio::test]
-async fn fetch_models_url_auto_fix_not_for_anthropic() {
+async fn fetch_models_url_auto_fix_rejects_legacy_anthropic_loopback() {
     let mock_server = MockServer::start().await;
     // Anthropic API fails
     Mock::given(method("GET"))
@@ -432,14 +411,10 @@ async fn fetch_models_url_auto_fix_not_for_anthropic() {
     let (router, db) = setup().await;
     let id = create_provider(&db, "anthropic", &mock_server.uri(), "bad-key").await;
 
-    // Even with tryFix=true, Anthropic should use fallback, not URL fix
+    // A legacy row cannot use protocol fallback to bypass endpoint policy.
     let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": true}));
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json = body_json(resp).await;
-    // Should be fallback models, no fixedBaseUrl
-    assert!(json["data"].get("fixed_base_url").is_none());
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------

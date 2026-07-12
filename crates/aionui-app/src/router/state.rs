@@ -253,7 +253,8 @@ pub async fn build_module_states(
         .map_err(|error| {
             RouterBuildError::new("router.knowledge.configure", "invalid knowledge worker configuration")
                 .with_source(error)
-        })?,
+        })?
+        .with_idempotency_pool(pool.clone()),
     );
     let decision =
         build_decision_state_with_knowledge(services, Arc::new(AppDecisionKnowledge::new(knowledge_gateway.clone())));

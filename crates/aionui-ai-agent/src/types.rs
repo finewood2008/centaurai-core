@@ -5,6 +5,63 @@ use serde::{Deserialize, Serialize};
 
 use crate::session_context::AgentSessionContext;
 
+/// Immutable classification of the model transport that will receive a turn.
+///
+/// `Unknown` is deliberately not treated as local by any egress policy. A
+/// target is local only when the final provider row used by the agent factory
+/// names an explicitly local platform and a numeric loopback URL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelEgressLocation {
+    Local,
+    External,
+    #[default]
+    Unknown,
+}
+
+/// Non-secret provider facts captured from the same immutable configuration
+/// used to build the actual model transport.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelEgressSnapshot {
+    pub provider_id: Option<String>,
+    pub location: ModelEgressLocation,
+}
+
+impl ModelEgressSnapshot {
+    pub fn external() -> Self {
+        Self {
+            provider_id: None,
+            location: ModelEgressLocation::External,
+        }
+    }
+}
+
+/// Classify a provider row for knowledge egress. Hostnames (including
+/// `localhost`), LAN addresses, malformed URLs, and non-local platforms fail
+/// closed as external.
+pub fn classify_model_egress(platform: &str, base_url: &str) -> ModelEgressLocation {
+    let explicitly_local = matches!(
+        platform.trim().to_ascii_lowercase().as_str(),
+        "ollama" | "local" | "llama.cpp" | "llamacpp"
+    );
+    if !explicitly_local {
+        return ModelEgressLocation::External;
+    }
+    let Ok(url) = url::Url::parse(base_url) else {
+        return ModelEgressLocation::External;
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.username() != "" || url.password().is_some() {
+        return ModelEgressLocation::External;
+    }
+    url.host_str()
+        .and_then(|host| {
+            host.trim_matches(|character| matches!(character, '[' | ']'))
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .filter(std::net::IpAddr::is_loopback)
+        .map_or(ModelEgressLocation::External, |_| ModelEgressLocation::Local)
+}
+
 /// Data payload for sending a user message to an Agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageData {
@@ -131,6 +188,9 @@ pub struct AionrsCompatOverrides {
 /// Fully resolved Aionrs configuration passed to the agent manager.
 #[derive(Debug, Clone)]
 pub struct AionrsResolvedConfig {
+    /// Provider/location snapshot captured from the exact row used to build
+    /// this transport. It never contains credentials or document content.
+    pub model_egress: ModelEgressSnapshot,
     /// LLM provider name (anthropic, openai, bedrock, vertex).
     pub provider: String,
     /// Decrypted API key.
@@ -172,6 +232,31 @@ mod tests {
     use super::*;
     use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
     use serde_json::json;
+
+    #[test]
+    fn model_egress_is_local_only_for_explicit_platform_and_numeric_loopback() {
+        assert_eq!(
+            classify_model_egress("ollama", "http://127.0.0.1:11434/v1"),
+            ModelEgressLocation::Local
+        );
+        assert_eq!(
+            classify_model_egress("llama.cpp", "http://[::1]:8080"),
+            ModelEgressLocation::Local
+        );
+        for (platform, endpoint) in [
+            ("ollama", "http://localhost:11434"),
+            ("ollama", "http://192.168.1.10:11434"),
+            ("ollama", "https://example.com"),
+            ("openai", "http://127.0.0.1:11434"),
+            ("local", "not-a-url"),
+        ] {
+            assert_eq!(
+                classify_model_egress(platform, endpoint),
+                ModelEgressLocation::External,
+                "{platform} {endpoint} must fail closed"
+            );
+        }
+    }
 
     #[test]
     fn acp_build_extra_accepts_payload_without_skills() {

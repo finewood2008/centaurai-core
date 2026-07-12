@@ -1,16 +1,21 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aionui_api_types::{BrainDefinition, BrainKind};
 use aionui_common::decrypt_string;
+use aionui_common::outbound::{OutboundHttpPolicy, is_numeric_loopback, resolve_pinned_http_endpoint};
+#[cfg(test)]
+use aionui_common::outbound::{validate_http_endpoint, validate_resolved_addresses as validate_outbound_addresses};
 use aionui_db::{IProviderRepository, models::Provider};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::ports::{
-    BrainCatalogPort, BrainExecutionFailure, BrainExecutionFailureKind, BrainExecutionPort, BrainInvocation,
-    BrainOpinion,
+    BrainCatalogPort, BrainExecutionFailure, BrainExecutionFailureKind, BrainExecutionPlan, BrainExecutionPort,
+    BrainInvocation, BrainLocation, BrainOpinion,
 };
 
 /// Executes provider-model brains without exposing decrypted credentials to a client.
@@ -21,7 +26,6 @@ use crate::ports::{
 pub struct ProviderBrainRuntime {
     providers: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
-    client: reqwest::Client,
 }
 
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -33,12 +37,6 @@ impl ProviderBrainRuntime {
         Self {
             providers,
             encryption_key,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
-                .timeout(PROVIDER_REQUEST_TIMEOUT)
-                .build()
-                .expect("static provider HTTP client configuration must be valid"),
         }
     }
 
@@ -85,15 +83,15 @@ impl BrainCatalogPort for ProviderBrainRuntime {
 
 #[async_trait::async_trait]
 impl BrainExecutionPort for ProviderBrainRuntime {
-    async fn execute(&self, invocation: BrainInvocation) -> Result<BrainOpinion, BrainExecutionFailure> {
-        if invocation.brain.kind != BrainKind::ProviderModel {
+    async fn prepare(&self, brain: &BrainDefinition) -> Result<BrainExecutionPlan, BrainExecutionFailure> {
+        if brain.kind != BrainKind::ProviderModel {
             return Err(BrainExecutionFailure::new(
                 BrainExecutionFailureKind::Unsupported,
                 "ACP brain requires an ACP execution adapter",
             ));
         }
 
-        let provider = self.provider(&invocation.brain.provider_id).await?;
+        let provider = self.provider(&brain.provider_id).await?;
         let api_key = decrypt_string(&provider.api_key_encrypted, &self.encryption_key)
             .map_err(|_| unavailable("provider credential could not be decrypted"))?;
         let api_key = api_key
@@ -104,28 +102,54 @@ impl BrainExecutionPort for ProviderBrainRuntime {
         if api_key.is_none() && !is_local_platform(&provider.platform) {
             return Err(unavailable("provider has no usable credential"));
         }
-        let protocol = provider_protocol(&provider, &invocation.brain.model);
-        let prompt = build_prompt(&invocation);
-        let url = validated_provider_url(&provider, protocol == "anthropic")?;
+        let protocol = provider_protocol(&provider, &brain.model);
+        let endpoint = resolve_provider_endpoint(&provider, &protocol).await?;
+        let address = endpoint.url.host_str().and_then(parse_host_ip);
+        let location = if is_local_platform(&provider.platform) && address.is_some_and(is_numeric_loopback) {
+            BrainLocation::Local
+        } else {
+            BrainLocation::External
+        };
+        Ok(BrainExecutionPlan::new(
+            brain.clone(),
+            location,
+            ProviderExecutionSnapshot {
+                protocol,
+                api_key,
+                endpoint,
+            },
+        ))
+    }
 
-        let request = if protocol == "anthropic" {
-            let request = self
-                .client
-                .post(url)
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": invocation.brain.model,
-                    "max_tokens": 2048,
-                    "system": invocation.role.instructions,
-                    "messages": [{"role": "user", "content": prompt}],
-                }));
-            if let Some(api_key) = api_key.as_deref() {
+    async fn execute(
+        &self,
+        plan: BrainExecutionPlan,
+        invocation: BrainInvocation,
+    ) -> Result<BrainOpinion, BrainExecutionFailure> {
+        if invocation.brain != plan.brain {
+            return Err(unavailable("prepared Brain does not match its invocation"));
+        }
+        let snapshot = plan
+            .payload::<ProviderExecutionSnapshot>()
+            .ok_or_else(|| unavailable("provider execution snapshot is invalid"))?;
+        let prompt = build_prompt(&invocation);
+        let client = &snapshot.endpoint.client;
+        let url = snapshot.endpoint.url.clone();
+
+        let request = if snapshot.protocol == "anthropic" {
+            let request = client.post(url).header("anthropic-version", "2023-06-01").json(&json!({
+                "model": invocation.brain.model,
+                "max_tokens": 2048,
+                "system": invocation.role.instructions,
+                "messages": [{"role": "user", "content": prompt}],
+            }));
+            if let Some(api_key) = snapshot.api_key.as_deref() {
                 request.header("x-api-key", api_key)
             } else {
                 request
             }
         } else {
-            let request = self.client.post(url).json(&json!({
+            let request = client.post(url).json(&json!({
                 "model": invocation.brain.model,
                 "messages": [
                     {"role": "system", "content": invocation.role.instructions},
@@ -133,7 +157,7 @@ impl BrainExecutionPort for ProviderBrainRuntime {
                 ],
                 "temperature": 0.2
             }));
-            if let Some(api_key) = api_key.as_deref() {
+            if let Some(api_key) = snapshot.api_key.as_deref() {
                 request.bearer_auth(api_key)
             } else {
                 request
@@ -164,7 +188,7 @@ impl BrainExecutionPort for ProviderBrainRuntime {
             return Err(unavailable(format!("provider returned HTTP {status}")));
         }
         let payload = limited_json(response).await?;
-        let content = if protocol == "anthropic" {
+        let content = if snapshot.protocol == "anthropic" {
             payload
                 .get("content")
                 .and_then(Value::as_array)
@@ -204,24 +228,36 @@ fn provider_protocol(provider: &Provider, model: &str) -> String {
         .unwrap_or_else(|| {
             if matches!(provider.platform.as_str(), "anthropic" | "claude") {
                 "anthropic".to_owned()
+            } else if provider.platform.eq_ignore_ascii_case("gemini") {
+                "gemini".to_owned()
             } else {
                 "openai".to_owned()
             }
         })
 }
 
-fn provider_url(provider: &Provider, anthropic: bool) -> String {
+fn provider_url(provider: &Provider, protocol: &str) -> String {
     let base = provider.base_url.trim_end_matches('/');
     if provider.is_full_url {
         return base.to_owned();
     }
-    if anthropic {
+    if protocol == "anthropic" {
         if base.ends_with("/v1/messages") {
             base.to_owned()
         } else if base.ends_with("/v1") {
             format!("{base}/messages")
         } else {
             format!("{base}/v1/messages")
+        }
+    } else if protocol == "gemini" || provider.platform.eq_ignore_ascii_case("gemini") {
+        if base.ends_with("/v1beta/openai/chat/completions") {
+            base.to_owned()
+        } else if base.ends_with("/v1beta/openai") {
+            format!("{base}/chat/completions")
+        } else if base.ends_with("/v1beta") {
+            format!("{base}/openai/chat/completions")
+        } else {
+            format!("{base}/v1beta/openai/chat/completions")
         }
     } else if base.ends_with("/chat/completions") {
         base.to_owned()
@@ -232,31 +268,62 @@ fn provider_url(provider: &Provider, anthropic: bool) -> String {
     }
 }
 
-fn validated_provider_url(provider: &Provider, anthropic: bool) -> Result<reqwest::Url, BrainExecutionFailure> {
-    let url =
-        reqwest::Url::parse(&provider_url(provider, anthropic)).map_err(|_| unavailable("provider URL is invalid"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+struct ResolvedProviderEndpoint {
+    url: reqwest::Url,
+    client: reqwest::Client,
+}
+
+struct ProviderExecutionSnapshot {
+    protocol: String,
+    api_key: Option<String>,
+    endpoint: ResolvedProviderEndpoint,
+}
+
+#[cfg(test)]
+fn validated_provider_url(provider: &Provider, protocol: &str) -> Result<reqwest::Url, BrainExecutionFailure> {
+    let policy = provider_outbound_policy(provider);
+    let url = validate_http_endpoint(&provider_url(provider, protocol), policy)
+        .map_err(|_| unavailable("provider URL violates the HTTP endpoint policy"))?;
+    if url.query().is_some() {
         return Err(unavailable("provider URL violates the HTTP endpoint policy"));
     }
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let address = host.parse::<IpAddr>().ok();
-    if address.is_some_and(forbidden_ip) {
-        return Err(unavailable("provider URL host is not allowed"));
-    }
-    let loopback = host == "localhost" || address.is_some_and(|address| address.is_loopback());
-    if is_local_platform(&provider.platform) && !loopback {
-        return Err(unavailable("local provider URL must use loopback"));
-    }
-    if !is_local_platform(&provider.platform) && loopback {
-        return Err(unavailable("loopback provider URL requires an explicit local platform"));
-    }
     Ok(url)
+}
+
+async fn resolve_provider_endpoint(
+    provider: &Provider,
+    protocol: &str,
+) -> Result<ResolvedProviderEndpoint, BrainExecutionFailure> {
+    let raw_url = provider_url(provider, protocol);
+    let endpoint = resolve_pinned_http_endpoint(
+        &raw_url,
+        provider_outbound_policy(provider),
+        PROVIDER_CONNECT_TIMEOUT,
+        PROVIDER_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|_| unavailable("provider endpoint failed outbound policy validation"))?;
+    if endpoint.url.query().is_some() {
+        return Err(unavailable("provider URL violates the HTTP endpoint policy"));
+    }
+    Ok(ResolvedProviderEndpoint {
+        url: endpoint.url,
+        client: endpoint.client,
+    })
+}
+
+#[cfg(test)]
+fn validate_resolved_addresses(provider: &Provider, addresses: &[SocketAddr]) -> Result<(), BrainExecutionFailure> {
+    validate_outbound_addresses(provider_outbound_policy(provider), addresses)
+        .map_err(|_| unavailable("provider host resolved to a forbidden address"))
+}
+
+fn provider_outbound_policy(provider: &Provider) -> OutboundHttpPolicy {
+    if is_local_platform(&provider.platform) {
+        OutboundHttpPolicy::NumericLoopback
+    } else {
+        OutboundHttpPolicy::PublicHttps
+    }
 }
 
 fn is_local_platform(platform: &str) -> bool {
@@ -266,16 +333,10 @@ fn is_local_platform(platform: &str) -> bool {
     )
 }
 
-fn forbidden_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            address.is_unspecified()
-                || address.is_link_local()
-                || address.is_multicast()
-                || address == Ipv4Addr::BROADCAST
-        }
-        IpAddr::V6(address) => address.is_unspecified() || address.is_unicast_link_local() || address.is_multicast(),
-    }
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
+    host.trim_matches(|character| matches!(character, '[' | ']'))
+        .parse()
+        .ok()
 }
 
 async fn limited_json(response: reqwest::Response) -> Result<Value, BrainExecutionFailure> {
@@ -343,7 +404,7 @@ mod tests {
     use aionui_api_types::{DecisionToolDefinition, RoleDefinition};
     use aionui_common::encrypt_string;
     use aionui_db::{CreateProviderParams, SqliteProviderRepository, init_database_memory};
-    use wiremock::matchers::method;
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -372,20 +433,58 @@ mod tests {
     #[test]
     fn builds_openai_and_anthropic_urls_without_double_suffixes() {
         assert_eq!(
-            provider_url(&provider("https://api.example/v1", false), false),
+            provider_url(&provider("https://api.example/v1", false), "openai"),
             "https://api.example/v1/chat/completions"
         );
         assert_eq!(
-            provider_url(&provider("https://api.anthropic.com", false), true),
+            provider_url(&provider("https://api.anthropic.com", false), "anthropic"),
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(
-            provider_url(&provider("https://proxy.example/v1", false), true),
+            provider_url(&provider("https://proxy.example/v1", false), "anthropic"),
             "https://proxy.example/v1/messages"
         );
         assert_eq!(
-            provider_url(&provider("https://proxy/full", true), false),
+            provider_url(&provider("https://proxy/full", true), "openai"),
             "https://proxy/full"
+        );
+    }
+
+    #[test]
+    fn builds_first_launch_provider_template_urls() {
+        let mut openai = provider("https://api.openai.com", false);
+        openai.platform = "openai".into();
+        assert_eq!(
+            provider_url(&openai, &provider_protocol(&openai, "gpt-5")),
+            "https://api.openai.com/v1/chat/completions"
+        );
+
+        let mut anthropic = provider("https://api.anthropic.com", false);
+        anthropic.platform = "anthropic".into();
+        assert_eq!(
+            provider_url(&anthropic, &provider_protocol(&anthropic, "claude-sonnet-4-5")),
+            "https://api.anthropic.com/v1/messages"
+        );
+
+        let mut gemini = provider("https://generativelanguage.googleapis.com", false);
+        gemini.platform = "gemini".into();
+        assert_eq!(
+            provider_url(&gemini, &provider_protocol(&gemini, "gemini-2.5-pro")),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+
+        let mut ollama = provider("http://127.0.0.1:11434", false);
+        ollama.platform = "ollama".into();
+        assert_eq!(
+            provider_url(&ollama, &provider_protocol(&ollama, "qwen3")),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+
+        let mut tokenclub = provider("https://tokenclub.example", false);
+        tokenclub.platform = "new-api".into();
+        assert_eq!(
+            provider_url(&tokenclub, &provider_protocol(&tokenclub, "gpt-5")),
+            "https://tokenclub.example/v1/chat/completions"
         );
     }
 
@@ -396,7 +495,7 @@ mod tests {
             "https://user:secret@example.com/v1",
             "https://example.com/v1#fragment",
         ] {
-            assert!(validated_provider_url(&provider(value, true), false).is_err());
+            assert!(validated_provider_url(&provider(value, true), "openai").is_err());
         }
     }
 
@@ -405,6 +504,16 @@ mod tests {
     }
 
     async fn runtime_with_key(base_url: String, api_key: &str) -> (ProviderBrainRuntime, aionui_db::Database) {
+        runtime_with_provider(base_url, api_key, "local", None, true).await
+    }
+
+    async fn runtime_with_provider(
+        base_url: String,
+        api_key: &str,
+        platform: &str,
+        model_protocols: Option<&str>,
+        is_full_url: bool,
+    ) -> (ProviderBrainRuntime, aionui_db::Database) {
         let database = init_database_memory().await.unwrap();
         let repository = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let key = [0x42; 32];
@@ -412,7 +521,7 @@ mod tests {
         repository
             .create(CreateProviderParams {
                 id: Some("provider-1"),
-                platform: "local",
+                platform,
                 name: "Provider",
                 base_url: &base_url,
                 api_key_encrypted: &encrypted,
@@ -420,11 +529,11 @@ mod tests {
                 enabled: true,
                 capabilities: "[]",
                 context_limit: None,
-                model_protocols: None,
+                model_protocols,
                 model_enabled: None,
                 model_health: None,
                 bedrock_config: None,
-                is_full_url: true,
+                is_full_url,
             })
             .await
             .unwrap();
@@ -456,6 +565,14 @@ mod tests {
         }
     }
 
+    async fn execute_prepared(
+        runtime: &ProviderBrainRuntime,
+        invocation: BrainInvocation,
+    ) -> Result<BrainOpinion, BrainExecutionFailure> {
+        let plan = runtime.prepare(&invocation.brain).await?;
+        runtime.execute(plan, invocation).await
+    }
+
     #[tokio::test]
     async fn redirect_is_not_followed_with_provider_credentials() {
         let target = MockServer::start().await;
@@ -474,7 +591,7 @@ mod tests {
             .await;
         let (runtime, _database) = runtime(format!("{}/redirect", source.uri())).await;
 
-        let error = runtime.execute(invocation()).await.unwrap_err();
+        let error = execute_prepared(&runtime, invocation()).await.unwrap_err();
         assert_eq!(error.kind, BrainExecutionFailureKind::Unavailable);
         source.verify().await;
         target.verify().await;
@@ -490,15 +607,82 @@ mod tests {
             .await;
         let (runtime, _database) = runtime(format!("{}/large", server.uri())).await;
 
-        let error = runtime.execute(invocation()).await.unwrap_err();
+        let error = execute_prepared(&runtime, invocation()).await.unwrap_err();
         assert_eq!(error.kind, BrainExecutionFailureKind::Unavailable);
         assert!(error.message.contains("size limit"));
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn gemini_byok_uses_openai_compatible_endpoint_and_bearer_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/openai/chat/completions"))
+            .and(header("authorization", "Bearer gemini-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "gemini opinion"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A loopback provider keeps this test hermetic. The explicit model
+        // protocol exercises the same Gemini OpenAI-compatible wire contract
+        // used by the external Gemini preset.
+        let (runtime, _database) = runtime_with_provider(
+            server.uri(),
+            "gemini-test-key",
+            "local",
+            Some(r#"{"model-1":"gemini"}"#),
+            false,
+        )
+        .await;
+
+        let opinion = execute_prepared(&runtime, invocation()).await.unwrap();
+        assert_eq!(opinion.content, "gemini opinion");
+        server.verify().await;
+    }
+
     #[test]
     fn metadata_endpoint_is_rejected() {
-        assert!(validated_provider_url(&provider("http://169.254.169.254/latest/meta-data", true), false).is_err());
+        assert!(validated_provider_url(&provider("http://169.254.169.254/latest/meta-data", true), "openai").is_err());
+    }
+
+    #[test]
+    fn resolved_dns_policy_is_fail_closed_for_dual_stack_and_rebinding_answers() {
+        let external = provider("https://api.example.test/v1", true);
+        let public_dual_stack = [
+            "8.8.8.8:443".parse::<SocketAddr>().unwrap(),
+            "[2606:4700:4700::1111]:443".parse::<SocketAddr>().unwrap(),
+        ];
+        assert!(validate_resolved_addresses(&external, &public_dual_stack).is_ok());
+
+        for poisoned in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "169.254.169.254:443",
+            "[::1]:443",
+            "[fc00::1]:443",
+            "[fe80::1]:443",
+        ] {
+            let answers = [
+                "8.8.8.8:443".parse::<SocketAddr>().unwrap(),
+                poisoned.parse::<SocketAddr>().unwrap(),
+            ];
+            assert!(validate_resolved_addresses(&external, &answers).is_err(), "{poisoned}");
+        }
+    }
+
+    #[test]
+    fn local_provider_requires_numeric_loopback_and_never_resolves_a_hostname() {
+        let mut local = provider("http://127.0.0.1:11434/v1", true);
+        local.platform = "ollama".into();
+        assert!(validated_provider_url(&local, "openai").is_ok());
+        local.base_url = "http://[::1]:11434/v1".into();
+        assert!(validated_provider_url(&local, "openai").is_ok());
+        local.base_url = "http://localhost:11434/v1".into();
+        assert!(validated_provider_url(&local, "openai").is_err());
+        local.base_url = "http://192.168.1.5:11434/v1".into();
+        assert!(validated_provider_url(&local, "openai").is_err());
     }
 
     #[tokio::test]
@@ -512,8 +696,36 @@ mod tests {
             .mount(&server)
             .await;
         let (runtime, _database) = runtime_with_key(format!("{}/local", server.uri()), "").await;
-        let opinion = runtime.execute(invocation()).await.unwrap();
+        let opinion = execute_prepared(&runtime, invocation()).await.unwrap();
         assert_eq!(opinion.content, "local opinion");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_attempt_is_immutable_across_provider_configuration_updates() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "snapshot opinion"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (runtime, database) = runtime(format!("{}/snapshot", server.uri())).await;
+        let invocation = invocation();
+        let plan = runtime.prepare(&invocation.brain).await.unwrap();
+        assert_eq!(plan.location, BrainLocation::Local);
+
+        sqlx::query(
+            "UPDATE providers SET platform = 'openai', base_url = 'https://api.invalid.example/v1' \
+             WHERE id = 'provider-1'",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let opinion = runtime.execute(plan, invocation).await.unwrap();
+        assert_eq!(opinion.content, "snapshot opinion");
         server.verify().await;
     }
 }

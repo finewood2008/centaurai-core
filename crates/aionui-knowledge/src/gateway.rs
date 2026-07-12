@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,6 +14,9 @@ use axum::http::{HeaderMap, Method as HttpMethod, StatusCode};
 use reqwest::Method;
 use reqwest::header::HeaderValue;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::client::WorkerClient;
 use crate::{KnowledgeConfigError, KnowledgeError};
@@ -25,6 +29,9 @@ const MAX_SPACE_ID_CHARS: usize = 128;
 const MAX_CHAPTER_CHARS: usize = 200;
 const MAX_MODEL_CONTEXT_TOKENS: u32 = 8_000;
 const APPROXIMATE_CHARS_PER_TOKEN: usize = 4;
+const UPLOAD_LEASE_MS: i64 = 120_000;
+const UPLOAD_PENDING_POLL_ATTEMPTS: usize = 1_200;
+const UPLOAD_PENDING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelLocation {
@@ -52,12 +59,25 @@ impl ModelLocationResolver for UnknownModelLocationResolver {
 pub struct KnowledgeGateway {
     worker: Option<WorkerClient>,
     model_location: Arc<dyn ModelLocationResolver>,
+    idempotency_pool: Option<SqlitePool>,
+    upload_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 pub(crate) struct KnowledgeSourceContent {
     pub(crate) status: StatusCode,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Body,
+}
+
+pub(crate) struct KnowledgeUploadIdempotency<'a> {
+    pub(crate) operation_key: &'a str,
+    pub(crate) request_fingerprint: &'a str,
+}
+
+enum UploadReservation {
+    Completed(Box<CreateKnowledgeSourceResponse>),
+    Acquired { lease_owner: String },
+    Pending,
 }
 
 impl std::fmt::Debug for KnowledgeGateway {
@@ -77,6 +97,8 @@ impl KnowledgeGateway {
         Ok(Self {
             worker: WorkerClient::from_environment(data_dir)?,
             model_location,
+            idempotency_pool: None,
+            upload_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -89,6 +111,8 @@ impl KnowledgeGateway {
         Ok(Self {
             worker: Some(WorkerClient::for_loopback_url(endpoint, token.into())?),
             model_location,
+            idempotency_pool: None,
+            upload_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -96,7 +120,14 @@ impl KnowledgeGateway {
         Self {
             worker: None,
             model_location: Arc::new(UnknownModelLocationResolver),
+            idempotency_pool: None,
+            upload_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_idempotency_pool(mut self, pool: SqlitePool) -> Self {
+        self.idempotency_pool = Some(pool);
+        self
     }
 
     fn worker(&self) -> Result<&WorkerClient, KnowledgeError> {
@@ -209,14 +240,274 @@ impl KnowledgeGateway {
         content_length: Option<HeaderValue>,
         body: Body,
     ) -> Result<CreateKnowledgeSourceResponse, KnowledgeError> {
+        self.upload_source_idempotent(None, None, content_type, content_length, body)
+            .await
+    }
+
+    pub(crate) async fn upload_source_idempotent(
+        &self,
+        user_id: Option<&str>,
+        idempotency: Option<KnowledgeUploadIdempotency<'_>>,
+        content_type: HeaderValue,
+        content_length: Option<HeaderValue>,
+        body: Body,
+    ) -> Result<CreateKnowledgeSourceResponse, KnowledgeError> {
+        let _operation_guard = if let Some(idempotency) = idempotency.as_ref() {
+            Some(
+                self.lock_upload_operation(
+                    user_id.ok_or(KnowledgeError::InvalidRequest)?,
+                    idempotency.operation_key,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let lease_owner = if let Some(idempotency) = idempotency.as_ref() {
+            let mut acquired = None;
+            for _ in 0..UPLOAD_PENDING_POLL_ATTEMPTS {
+                match self.reserve_upload_idempotency(user_id, idempotency).await? {
+                    UploadReservation::Completed(response) => return Ok(*response),
+                    UploadReservation::Acquired { lease_owner } => {
+                        acquired = Some(lease_owner);
+                        break;
+                    }
+                    UploadReservation::Pending => tokio::time::sleep(UPLOAD_PENDING_POLL_INTERVAL).await,
+                }
+            }
+            Some(acquired.ok_or(KnowledgeError::Unavailable)?)
+        } else {
+            None
+        };
+        let worker_operation_key = idempotency.as_ref().map(|idempotency| {
+            let mut digest = Sha256::new();
+            digest.update(user_id.unwrap_or_default().as_bytes());
+            digest.update(b"\0");
+            digest.update(idempotency.operation_key.as_bytes());
+            format!("core-{}", hex::encode(digest.finalize()))
+        });
         let response = self
             .worker()?
-            .upload::<CreateKnowledgeSourceResponse>(content_type, content_length, body)
-            .await?;
+            .upload::<CreateKnowledgeSourceResponse>(
+                content_type,
+                content_length,
+                body,
+                worker_operation_key
+                    .as_deref()
+                    .zip(idempotency.as_ref().map(|value| value.request_fingerprint)),
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let (Some(idempotency), Some(lease_owner)) = (idempotency.as_ref(), lease_owner.as_deref()) {
+                    self.expire_upload_lease(user_id, idempotency, lease_owner).await;
+                }
+                return Err(error);
+            }
+        };
         if response.job_id == response.job.id && validate_source(&response.source) && validate_job(&response.job) {
+            if let (Some(idempotency), Some(lease_owner)) = (idempotency.as_ref(), lease_owner.as_deref()) {
+                self.complete_upload_idempotency(user_id, idempotency, lease_owner, &response)
+                    .await?;
+            }
             Ok(response)
         } else {
+            if let (Some(idempotency), Some(lease_owner)) = (idempotency.as_ref(), lease_owner.as_deref()) {
+                self.expire_upload_lease(user_id, idempotency, lease_owner).await;
+            }
             Err(KnowledgeError::InvalidResponse)
+        }
+    }
+
+    async fn lock_upload_operation(&self, user_id: &str, operation_key: &str) -> OwnedMutexGuard<()> {
+        let lock_key = format!("{user_id}\0{operation_key}");
+        let lock = {
+            let mut locks = self.upload_locks.lock().await;
+            // Completed operations remain durable in SQLite. Periodic pruning
+            // bounds the in-memory coordinator without removing locks that
+            // are currently held or awaited.
+            if locks.len() > 4_096 {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            locks
+                .entry(lock_key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn reserve_upload_idempotency(
+        &self,
+        user_id: Option<&str>,
+        idempotency: &KnowledgeUploadIdempotency<'_>,
+    ) -> Result<UploadReservation, KnowledgeError> {
+        let user_id = user_id.ok_or(KnowledgeError::InvalidRequest)?;
+        let pool = self.idempotency_pool.as_ref().ok_or(KnowledgeError::Unavailable)?;
+        let now = aionui_common::now_ms();
+        let lease_owner = aionui_common::generate_prefixed_id("upload_lease");
+        let inserted = sqlx::query(
+            "INSERT INTO idempotency_records (id, user_id, operation_scope, operation_key, request_fingerprint, \
+             resource_id, response_json, state, lease_owner, lease_expires_at, created_at) \
+             VALUES (?, ?, 'knowledge.source.upload', ?, ?, '', NULL, 'pending', ?, ?, ?) \
+             ON CONFLICT(user_id, operation_scope, operation_key) DO NOTHING",
+        )
+        .bind(aionui_common::generate_prefixed_id("idem"))
+        .bind(user_id)
+        .bind(idempotency.operation_key)
+        .bind(idempotency.request_fingerprint)
+        .bind(&lease_owner)
+        .bind(now.saturating_add(UPLOAD_LEASE_MS))
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "knowledge upload idempotency reservation failed");
+            KnowledgeError::Unavailable
+        })?;
+        if inserted.rows_affected() == 1 {
+            return Ok(UploadReservation::Acquired { lease_owner });
+        }
+
+        let row: Option<(String, Option<String>, String, Option<i64>)> = sqlx::query_as(
+            "SELECT request_fingerprint, response_json, state, lease_expires_at FROM idempotency_records \
+             WHERE user_id = ? AND operation_scope = 'knowledge.source.upload' AND operation_key = ?",
+        )
+        .bind(user_id)
+        .bind(idempotency.operation_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "knowledge upload idempotency reservation lookup failed");
+            KnowledgeError::Unavailable
+        })?;
+        let Some((fingerprint, response_json, state, lease_expires_at)) = row else {
+            return Err(KnowledgeError::Unavailable);
+        };
+        if fingerprint != idempotency.request_fingerprint {
+            return Err(KnowledgeError::Conflict);
+        }
+        if state == "completed" {
+            let response = response_json
+                .as_deref()
+                .ok_or(KnowledgeError::InvalidResponse)
+                .and_then(|value| serde_json::from_str(value).map_err(|_| KnowledgeError::InvalidResponse))?;
+            return Ok(UploadReservation::Completed(Box::new(response)));
+        }
+        if state != "pending" {
+            return Err(KnowledgeError::InvalidResponse);
+        }
+        if lease_expires_at.is_some_and(|expires_at| expires_at > now) {
+            return Ok(UploadReservation::Pending);
+        }
+        let claimed = sqlx::query(
+            "UPDATE idempotency_records SET lease_owner = ?, lease_expires_at = ? \
+             WHERE user_id = ? AND operation_scope = 'knowledge.source.upload' AND operation_key = ? \
+             AND request_fingerprint = ? AND state = 'pending' \
+             AND COALESCE(lease_expires_at, 0) <= ?",
+        )
+        .bind(&lease_owner)
+        .bind(now.saturating_add(UPLOAD_LEASE_MS))
+        .bind(user_id)
+        .bind(idempotency.operation_key)
+        .bind(idempotency.request_fingerprint)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "knowledge upload expired lease claim failed");
+            KnowledgeError::Unavailable
+        })?;
+        if claimed.rows_affected() == 1 {
+            Ok(UploadReservation::Acquired { lease_owner })
+        } else {
+            Ok(UploadReservation::Pending)
+        }
+    }
+
+    async fn complete_upload_idempotency(
+        &self,
+        user_id: Option<&str>,
+        idempotency: &KnowledgeUploadIdempotency<'_>,
+        lease_owner: &str,
+        response: &CreateKnowledgeSourceResponse,
+    ) -> Result<(), KnowledgeError> {
+        let user_id = user_id.ok_or(KnowledgeError::InvalidRequest)?;
+        let pool = self.idempotency_pool.as_ref().ok_or(KnowledgeError::Unavailable)?;
+        let stored = sqlx::query(
+            "UPDATE idempotency_records SET resource_id = ?, response_json = ?, state = 'completed', \
+             lease_owner = NULL, lease_expires_at = NULL \
+             WHERE user_id = ? AND operation_scope = 'knowledge.source.upload' AND operation_key = ? \
+             AND request_fingerprint = ? AND state = 'pending' AND lease_owner = ?",
+        )
+        .bind(&response.source.id)
+        .bind(serde_json::to_string(response).map_err(|_| KnowledgeError::InvalidResponse)?)
+        .bind(user_id)
+        .bind(idempotency.operation_key)
+        .bind(idempotency.request_fingerprint)
+        .bind(lease_owner)
+        .execute(pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "knowledge upload idempotency completion failed");
+            KnowledgeError::Unavailable
+        })?;
+        if stored.rows_affected() == 1 {
+            return Ok(());
+        }
+        let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT request_fingerprint, response_json, state FROM idempotency_records \
+             WHERE user_id = ? AND operation_scope = 'knowledge.source.upload' AND operation_key = ?",
+        )
+        .bind(user_id)
+        .bind(idempotency.operation_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "knowledge upload completion reconciliation failed");
+            KnowledgeError::Unavailable
+        })?;
+        let Some((fingerprint, response_json, state)) = row else {
+            return Err(KnowledgeError::Unavailable);
+        };
+        if fingerprint != idempotency.request_fingerprint || state != "completed" {
+            return Err(KnowledgeError::Conflict);
+        }
+        let existing: CreateKnowledgeSourceResponse =
+            response_json
+                .as_deref()
+                .ok_or(KnowledgeError::InvalidResponse)
+                .and_then(|value| serde_json::from_str(value).map_err(|_| KnowledgeError::InvalidResponse))?;
+        if existing.source.id == response.source.id {
+            Ok(())
+        } else {
+            Err(KnowledgeError::Conflict)
+        }
+    }
+
+    async fn expire_upload_lease(
+        &self,
+        user_id: Option<&str>,
+        idempotency: &KnowledgeUploadIdempotency<'_>,
+        lease_owner: &str,
+    ) {
+        let (Some(user_id), Some(pool)) = (user_id, self.idempotency_pool.as_ref()) else {
+            return;
+        };
+        if let Err(error) = sqlx::query(
+            "UPDATE idempotency_records SET lease_expires_at = 0 \
+             WHERE user_id = ? AND operation_scope = 'knowledge.source.upload' AND operation_key = ? \
+             AND request_fingerprint = ? AND state = 'pending' AND lease_owner = ?",
+        )
+        .bind(user_id)
+        .bind(idempotency.operation_key)
+        .bind(idempotency.request_fingerprint)
+        .bind(lease_owner)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(error = %error, "knowledge upload idempotency lease expiry failed");
         }
     }
 
@@ -279,6 +570,21 @@ impl KnowledgeGateway {
         self.search_worker(request).await
     }
 
+    /// Evaluate cloud egress consent independently from local retrieval.
+    /// Mixed decisions use this after retrieving once for local Brains so an
+    /// unapproved cloud Brain cannot suppress local evidence.
+    pub async fn cloud_authorized(&self, requested_space_ids: &[String]) -> Result<bool, KnowledgeError> {
+        if requested_space_ids.is_empty() || requested_space_ids.iter().any(|space_id| !valid_id(space_id)) {
+            return Ok(false);
+        }
+        let spaces = self.list_spaces().await?;
+        Ok(requested_space_ids.iter().all(|requested| {
+            spaces
+                .iter()
+                .any(|space| space.id == *requested && space.cloud_use == KnowledgeCloudUse::Allowed)
+        }))
+    }
+
     pub async fn enrich_message(
         &self,
         user_id: &str,
@@ -297,7 +603,30 @@ impl KnowledgeGateway {
         }
 
         let location = self.model_location.resolve(user_id, conversation_id).await;
-        let may_supply_context = location == ModelLocation::Local || policy.cloud_use;
+        // Record consent independently from this preflight location. The
+        // actual provider can change while a turn is queued or be replaced by
+        // a route/recovery fallback, so the dispatch boundary must be able to
+        // distinguish an explicitly authorized bundle from one that was only
+        // safe for the model that happened to be local at retrieval time.
+        let cloud_authorized = if policy.cloud_use {
+            match self.cloud_authorized(&policy.space_ids).await {
+                Ok(authorized) => authorized,
+                Err(error) if location == ModelLocation::Local => {
+                    tracing::warn!(
+                        error = %error,
+                        "knowledge cloud-consent lookup failed closed; local retrieval remains available"
+                    );
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        if location != ModelLocation::Local && policy.cloud_use && !cloud_authorized {
+            return Err(KnowledgeError::CloudConsentRequired);
+        }
+        let may_supply_context = location == ModelLocation::Local || cloud_authorized;
         if !may_supply_context {
             return if policy.mode == SendMessageKnowledgeMode::Required {
                 Err(KnowledgeError::CloudConsentRequired)
@@ -311,10 +640,13 @@ impl KnowledgeGateway {
             mode: KnowledgeSearchMode::Hybrid,
             space_ids: policy.space_ids,
             max_hits: policy.max_hits,
-            cloud_use: location != ModelLocation::Local,
+            // Retrieval always stays on the managed worker. Whether its hits
+            // may leave the device is represented by `cloud_authorized` and
+            // re-evaluated against the final transport at dispatch time.
+            cloud_use: false,
             media_type: None,
         };
-        let bundle = match self.search(search).await {
+        let mut bundle = match self.search(search).await {
             Ok(bundle) => bundle,
             Err(KnowledgeError::NotConfigured | KnowledgeError::Unavailable | KnowledgeError::Timeout)
                 if policy.mode == SendMessageKnowledgeMode::Auto =>
@@ -326,6 +658,7 @@ impl KnowledgeGateway {
         if bundle.hits.is_empty() && policy.mode == SendMessageKnowledgeMode::Required {
             return Err(KnowledgeError::NoResults);
         }
+        bundle.cloud_authorized = cloud_authorized;
         request.retrieval = Some(bundle);
         Ok(())
     }
@@ -365,16 +698,7 @@ impl KnowledgeGateway {
     }
 
     async fn require_cloud_consent(&self, requested_space_ids: &[String]) -> Result<(), KnowledgeError> {
-        if requested_space_ids.is_empty() {
-            return Err(KnowledgeError::CloudConsentRequired);
-        }
-        let spaces = self.list_spaces().await?;
-        let all_allowed = requested_space_ids.iter().all(|requested| {
-            spaces
-                .iter()
-                .any(|space| space.id == *requested && space.cloud_use == KnowledgeCloudUse::Allowed)
-        });
-        if all_allowed {
+        if self.cloud_authorized(requested_space_ids).await? {
             Ok(())
         } else {
             Err(KnowledgeError::CloudConsentRequired)

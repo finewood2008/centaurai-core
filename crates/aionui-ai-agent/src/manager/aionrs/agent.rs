@@ -26,7 +26,7 @@ use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::error::AgentError;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::{AionrsResolvedConfig, SendMessageData};
+use crate::types::{AionrsResolvedConfig, ModelEgressSnapshot, SendMessageData};
 
 use super::error::aionrs_engine_error_to_send_error;
 
@@ -77,6 +77,7 @@ fn build_aionrs_final_input_dump_value(
 
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
+    model_egress: ModelEgressSnapshot,
     engine: Mutex<AgentEngine>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
@@ -229,6 +230,7 @@ impl AionrsAgentManager {
 
         Ok(Self {
             runtime,
+            model_egress: config_extra.model_egress,
             engine: Mutex::new(engine),
             slash_commands,
             mcp_managers: result.mcp_managers,
@@ -238,6 +240,12 @@ impl AionrsAgentManager {
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
+    }
+
+    /// Immutable provider/location facts from the row that built this model
+    /// transport. Used immediately before dispatching private knowledge.
+    pub fn model_egress_snapshot(&self) -> &ModelEgressSnapshot {
+        &self.model_egress
     }
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
@@ -591,6 +599,7 @@ mod tests {
 
     fn make_test_config() -> AionrsResolvedConfig {
         AionrsResolvedConfig {
+            model_egress: Default::default(),
             provider: "anthropic".into(),
             api_key: "sk-test-key".into(),
             model: "claude-sonnet-4-20250514".into(),

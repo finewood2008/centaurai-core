@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,14 +10,16 @@ use aionui_api_types::{
 use aionui_realtime::EventBroadcaster;
 use futures_util::future::join_all;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, watch};
 
 use crate::DecisionError;
 use crate::ports::{
     BrainCatalogPort, BrainExecutionFailure, BrainExecutionFailureKind, BrainExecutionPort, BrainInvocation,
-    BrainOpinion, DecisionKnowledgePort, DecisionKnowledgeRequest, NoopDecisionKnowledge,
+    BrainLocation, BrainOpinion, DecisionKnowledgePort, DecisionKnowledgeRequest, DecisionKnowledgeResult,
+    NoopDecisionKnowledge,
 };
-use crate::repository::{CompletedOpinion, DecisionRepository, NewDecision, PersistedDecisionContext};
+use crate::repository::{CompletedOpinion, DecisionRepository, EgressAudit, NewDecision, PersistedDecisionContext};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 const MIN_BRAINS: usize = 3;
@@ -39,6 +41,24 @@ enum BrainRunOutcome {
     Success,
     Failed,
     Stopped,
+}
+
+struct SelectedEvidence {
+    items: Vec<DecisionEvidenceInput>,
+    evidence_ids: Vec<String>,
+    retrieval_bundle_id: Option<String>,
+    lineage_bundle_ids: Vec<String>,
+    cloud_egress_allowed: bool,
+    retrieval_hit_count: usize,
+}
+
+struct AttemptSuccess {
+    turn_id: String,
+    opinion: BrainOpinion,
+    retrieval_bundle_id: Option<String>,
+    lineage_bundle_ids: Vec<String>,
+    cloud_egress_allowed: bool,
+    origin_location: BrainLocation,
 }
 
 pub struct DecisionService {
@@ -131,13 +151,35 @@ impl DecisionService {
     pub async fn create(
         &self,
         user_id: &str,
-        mut request: CreateDecisionRequest,
+        request: CreateDecisionRequest,
     ) -> Result<DecisionResponse, DecisionError> {
+        self.create_with_idempotency(user_id, request, None).await
+    }
+
+    pub async fn create_with_idempotency(
+        &self,
+        user_id: &str,
+        mut request: CreateDecisionRequest,
+        header_operation_id: Option<&str>,
+    ) -> Result<DecisionResponse, DecisionError> {
+        let operation_id = normalize_operation_id(header_operation_id, request.client_operation_id.take())?;
         request.question = validate_text(request.question, "question", 8_000)?;
         if !(MIN_BRAINS..=MAX_BRAINS).contains(&request.brain_count) {
             return Err(DecisionError::InvalidRequest(format!(
                 "brain_count must be between {MIN_BRAINS} and {MAX_BRAINS}"
             )));
+        }
+        // The idempotency identity belongs to the client's normalized input,
+        // not to dynamic server-side Brain selection. A lost-ack retry must
+        // still return the original decision if the provider catalog changed.
+        let request_fingerprint = request_fingerprint(&request)?;
+        if let Some(operation_id) = operation_id.as_deref()
+            && let Some(existing) = self
+                .repository
+                .idempotent_decision(user_id, operation_id, &request_fingerprint)
+                .await?
+        {
+            return Ok(existing);
         }
         let roles = normalize_roles(request.roles)?;
         let mut brains = if request.brains.is_empty() {
@@ -158,12 +200,11 @@ impl DecisionService {
         };
         validate_tools(&request.tools)?;
         assign_and_validate_brains(&mut brains, &roles, &request.tools)?;
-        let mut evidence = normalize_user_notes(request.evidence);
-        evidence.extend(
-            self.retrieve_knowledge(user_id, None, &request.question, &request.knowledge)
-                .await?,
-        );
-        let response = self
+        let user_evidence = normalize_user_notes(request.evidence);
+        let knowledge = self
+            .retrieve_knowledge(user_id, None, &request.question, &request.knowledge)
+            .await?;
+        let response = match self
             .repository
             .create(NewDecision {
                 user_id,
@@ -173,9 +214,33 @@ impl DecisionService {
                 roles: &roles,
                 tools: &request.tools,
                 brains: &brains,
-                evidence: &evidence,
+                user_evidence: &user_evidence,
+                retrieval_evidence: &knowledge.evidence,
+                retrieval: knowledge.retrieval.as_ref(),
+                idempotency_key: operation_id.as_deref(),
+                request_fingerprint: operation_id.as_ref().map(|_| request_fingerprint.as_str()),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(DecisionError::Database(_)) if operation_id.is_some() => {
+                if let Some(existing) = self
+                    .repository
+                    .idempotent_decision(
+                        user_id,
+                        operation_id.as_deref().expect("checked above"),
+                        &request_fingerprint,
+                    )
+                    .await?
+                {
+                    return Ok(existing);
+                }
+                return Err(DecisionError::Internal(
+                    "idempotent decision creation could not be reconciled".into(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         self.emit_to_user(user_id, "decision.sessionChanged", &response)?;
         Ok(response)
     }
@@ -408,8 +473,8 @@ impl DecisionService {
                 )
                 .await?;
             match result {
-                Ok((turn_id, opinion)) => {
-                    self.persist_success(user_id, decision_id, rank, &brain, &original, &turn_id, opinion, None)
+                Ok(success) => {
+                    self.persist_success(user_id, decision_id, rank, &brain, &original, success, None)
                         .await?;
                     return Ok(BrainRunOutcome::Success);
                 }
@@ -441,15 +506,14 @@ impl DecisionService {
                 .execute_attempt(decision_id, &brain, &context, fallback.clone(), 3, receiver)
                 .await?
             {
-                Ok((turn_id, opinion)) => {
+                Ok(success) => {
                     self.persist_success(
                         user_id,
                         decision_id,
                         rank,
                         &brain,
                         &fallback,
-                        &turn_id,
-                        opinion,
+                        success,
                         Some(&fallback.provider_id),
                     )
                     .await?;
@@ -484,7 +548,7 @@ impl DecisionService {
         definition: BrainDefinition,
         attempt: i64,
         mut control: watch::Receiver<RunControl>,
-    ) -> Result<Result<(String, BrainOpinion), BrainExecutionFailure>, DecisionError> {
+    ) -> Result<Result<AttemptSuccess, BrainExecutionFailure>, DecisionError> {
         let role = context
             .roles
             .iter()
@@ -506,17 +570,98 @@ impl DecisionService {
                 attempt,
                 &definition.provider_id,
                 &definition.model,
+                None,
+                &[],
+                &[],
+                false,
+                "unknown",
             )
+            .await?;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let plan = tokio::select! {
+            control = wait_for_control(&mut control) => {
+                let label = match control {
+                    RunControl::Paused => "decision paused",
+                    RunControl::Cancelled => "decision cancelled",
+                    RunControl::Running => "decision run ended",
+                };
+                Err(BrainExecutionFailure::new(BrainExecutionFailureKind::Cancelled, label))
+            }
+            result = tokio::time::timeout_at(deadline, self.executor.prepare(&definition)) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => Err(BrainExecutionFailure::new(
+                        BrainExecutionFailureKind::Timeout,
+                        "brain preparation exceeded its attempt deadline",
+                    )),
+                }
+            }
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(failure) => {
+                self.repository
+                    .record_egress(EgressAudit {
+                        decision_id,
+                        session_id: &context.session_id,
+                        brain_id: &brain.id,
+                        turn_id: &turn_id,
+                        provider_id: &definition.provider_id,
+                        model: &definition.model,
+                        location: "unknown",
+                        retrieval: context.retrieval.as_ref(),
+                        knowledge_egress_allowed: false,
+                        hit_count: 0,
+                        evidence_ids: &[],
+                        lineage_bundle_ids: &[],
+                    })
+                    .await?;
+                self.repository.fail_turn(&turn_id, failure.kind.code()).await?;
+                return Ok(Err(failure));
+            }
+        };
+        let location = plan.location;
+        let selected = evidence_for_brain(context, location);
+        self.repository
+            .set_turn_execution_context(
+                &turn_id,
+                selected.retrieval_bundle_id.as_deref(),
+                &selected.evidence_ids,
+                &selected.lineage_bundle_ids,
+                selected.cloud_egress_allowed,
+                location_label(location),
+            )
+            .await?;
+        let external = location != BrainLocation::Local;
+        self.repository
+            .record_egress(EgressAudit {
+                decision_id,
+                session_id: &context.session_id,
+                brain_id: &brain.id,
+                turn_id: &turn_id,
+                provider_id: &definition.provider_id,
+                model: &definition.model,
+                location: location_label(location),
+                retrieval: context.retrieval.as_ref(),
+                knowledge_egress_allowed: external
+                    && context
+                        .retrieval
+                        .as_ref()
+                        .is_some_and(|retrieval| retrieval.bundle.cloud_authorized),
+                hit_count: selected.retrieval_hit_count,
+                evidence_ids: &selected.evidence_ids,
+                lineage_bundle_ids: &selected.lineage_bundle_ids,
+            })
             .await?;
         let invocation = BrainInvocation {
             decision_id: decision_id.to_owned(),
             session_id: context.session_id.clone(),
-            brain: definition,
+            brain: plan.brain.clone(),
             question: context.question.clone(),
             role,
             tools,
             interjections: context.interjections.clone(),
-            evidence: context.evidence.clone(),
+            evidence: selected.items,
         };
         let result = tokio::select! {
             control = wait_for_control(&mut control) => {
@@ -527,7 +672,7 @@ impl DecisionService {
                 };
                 Err(BrainExecutionFailure::new(BrainExecutionFailureKind::Cancelled, label))
             }
-            result = tokio::time::timeout(self.timeout, self.executor.execute(invocation)) => {
+            result = tokio::time::timeout_at(deadline, self.executor.execute(plan, invocation)) => {
                 match result {
                     Ok(result) => result,
                     Err(_) => Err(BrainExecutionFailure::new(
@@ -540,7 +685,14 @@ impl DecisionService {
         if let Err(failure) = &result {
             self.repository.fail_turn(&turn_id, failure.kind.code()).await?;
         }
-        Ok(result.map(|opinion| (turn_id, opinion)))
+        Ok(result.map(|opinion| AttemptSuccess {
+            turn_id,
+            opinion,
+            retrieval_bundle_id: selected.retrieval_bundle_id,
+            lineage_bundle_ids: selected.lineage_bundle_ids,
+            cloud_egress_allowed: selected.cloud_egress_allowed,
+            origin_location: location,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -551,30 +703,35 @@ impl DecisionService {
         rank: i64,
         brain: &DecisionBrainResponse,
         executed: &BrainDefinition,
-        turn_id: &str,
-        opinion: BrainOpinion,
+        success: AttemptSuccess,
         fallback_provider_id: Option<&str>,
     ) -> Result<(), DecisionError> {
-        let mut evidence = opinion.evidence;
+        let mut evidence = success.opinion.evidence;
         if evidence.is_empty() {
             evidence.push(DecisionEvidenceInput {
                 source_id: format!("provider:{}:{}", executed.provider_id, executed.model),
                 title: format!("AI opinion · {}", executed.model),
-                snippet: truncate(&opinion.content, 4_000),
+                snippet: truncate(&success.opinion.content, 4_000),
                 score: 1.0,
                 media_type: "ai_opinion".into(),
                 page: None,
                 chapter: None,
                 timestamp_ms: None,
+                end_seconds: None,
+                uri: None,
             });
         }
         self.repository
             .complete_opinion(CompletedOpinion {
                 decision_id,
                 brain,
-                turn_id,
-                content: &opinion.content,
+                turn_id: &success.turn_id,
+                content: &success.opinion.content,
                 evidence: &evidence,
+                retrieval_bundle_id: success.retrieval_bundle_id.as_deref(),
+                lineage_bundle_ids: &success.lineage_bundle_ids,
+                cloud_egress_allowed: success.cloud_egress_allowed,
+                origin_location: location_label(success.origin_location),
                 rank,
                 fallback_provider_id,
             })
@@ -585,7 +742,7 @@ impl DecisionService {
             json!({
                 "decision_id": decision_id,
                 "brain_id": brain.id,
-                "delta": opinion.content,
+                "delta": success.opinion.content,
             }),
         );
         for hit in evidence {
@@ -699,12 +856,18 @@ impl DecisionService {
         emit: bool,
     ) -> Result<Vec<DecisionEvidenceInput>, DecisionError> {
         let (question, policy) = self.repository.knowledge_context(user_id, id).await?;
-        let evidence = self.retrieve_knowledge(user_id, Some(id), &question, &policy).await?;
+        let knowledge = self.retrieve_knowledge(user_id, Some(id), &question, &policy).await?;
+        let before = self.repository.get(user_id, id).await?.evidence.len();
+        if let Some(bundle) = knowledge.retrieval.as_ref() {
+            self.repository
+                .store_retrieval_evidence(user_id, id, bundle, &knowledge.evidence)
+                .await?;
+        }
+        let evidence = knowledge.evidence;
         if evidence.is_empty() {
             return Ok(evidence);
         }
-        let before = self.repository.get(user_id, id).await?.evidence.len();
-        let stored = self.repository.add_evidence(user_id, id, &evidence).await?;
+        let stored = self.repository.get(user_id, id).await?.evidence;
         if emit {
             for hit in stored.into_iter().skip(before) {
                 self.emit_value_to_user(
@@ -723,7 +886,7 @@ impl DecisionService {
         decision_id: Option<&str>,
         question: &str,
         policy: &serde_json::Value,
-    ) -> Result<Vec<DecisionEvidenceInput>, DecisionError> {
+    ) -> Result<DecisionKnowledgeResult, DecisionError> {
         let mode = policy.get("mode").and_then(serde_json::Value::as_str).unwrap_or("auto");
         if !matches!(mode, "off" | "auto" | "required") {
             return Err(DecisionError::InvalidRequest(
@@ -731,9 +894,9 @@ impl DecisionService {
             ));
         }
         if mode == "off" {
-            return Ok(Vec::new());
+            return Ok(DecisionKnowledgeResult::default());
         }
-        let evidence = self
+        let evidence = match self
             .knowledge
             .retrieve(DecisionKnowledgeRequest {
                 user_id: user_id.to_owned(),
@@ -742,9 +905,25 @@ impl DecisionService {
                 policy: policy.clone(),
             })
             .await
-            .map_err(|error| DecisionError::KnowledgeUnavailable(error.message))?;
-        validate_gateway_evidence(&evidence)?;
-        if mode == "required" && evidence.is_empty() {
+        {
+            Ok(evidence) => evidence,
+            Err(error) if mode == "auto" => {
+                tracing::warn!(
+                    decision_id = decision_id.unwrap_or("new"),
+                    error = %error,
+                    "optional decision knowledge retrieval unavailable"
+                );
+                DecisionKnowledgeResult::default()
+            }
+            Err(error) => return Err(DecisionError::KnowledgeUnavailable(error.message)),
+        };
+        validate_gateway_evidence(&evidence.evidence)?;
+        if !evidence.evidence.is_empty() && evidence.retrieval.is_none() {
+            return Err(DecisionError::KnowledgeUnavailable(
+                "knowledge gateway returned evidence without a retrieval bundle".into(),
+            ));
+        }
+        if mode == "required" && evidence.evidence.is_empty() {
             return Err(DecisionError::Conflict(
                 "knowledge mode is required but retrieval returned no evidence".into(),
             ));
@@ -987,6 +1166,103 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+fn normalize_operation_id(header: Option<&str>, body: Option<String>) -> Result<Option<String>, DecisionError> {
+    let header = header.map(str::trim).filter(|value| !value.is_empty());
+    let body = body.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if let (Some(header), Some(body)) = (header, body)
+        && header != body
+    {
+        return Err(DecisionError::Conflict(
+            "Idempotency-Key and client_operation_id must match when both are provided".into(),
+        ));
+    }
+    let value = header.or(body);
+    if let Some(value) = value
+        && (!(8..=128).contains(&value.len())
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')))
+    {
+        return Err(DecisionError::InvalidRequest(
+            "operation id must be 8-128 ASCII alphanumerics or '-', '_', '.', ':'".into(),
+        ));
+    }
+    Ok(value.map(str::to_owned))
+}
+
+fn request_fingerprint(request: &CreateDecisionRequest) -> Result<String, DecisionError> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(request)?)))
+}
+
+fn evidence_for_brain(context: &PersistedDecisionContext, location: BrainLocation) -> SelectedEvidence {
+    let current = context.retrieval.as_ref();
+    let selected = context
+        .evidence
+        .iter()
+        .filter(|evidence| location == BrainLocation::Local || external_evidence_allowed(evidence, current))
+        .collect::<Vec<_>>();
+    let mut lineage_bundle_ids = BTreeSet::new();
+    for evidence in &selected {
+        lineage_bundle_ids.extend(evidence.lineage_bundle_ids.iter().cloned());
+        if let Some(bundle_id) = &evidence.retrieval_bundle_id {
+            lineage_bundle_ids.insert(bundle_id.clone());
+        }
+    }
+    let lineage_bundle_ids = lineage_bundle_ids.into_iter().collect::<Vec<_>>();
+    let retrieval_hit_count = current.map_or(0, |retrieval| {
+        selected
+            .iter()
+            .filter(|evidence| evidence.retrieval_bundle_id.as_deref() == Some(retrieval.id.as_str()))
+            .count()
+    });
+    let retrieval_bundle_id = current
+        .filter(|retrieval| lineage_bundle_ids.iter().any(|id| id == &retrieval.id))
+        .map(|retrieval| retrieval.id.clone());
+    SelectedEvidence {
+        items: selected.iter().map(|item| item.evidence.clone()).collect(),
+        evidence_ids: selected.iter().map(|item| item.id.clone()).collect(),
+        retrieval_bundle_id,
+        lineage_bundle_ids,
+        cloud_egress_allowed: selected.iter().all(|item| item.cloud_egress_allowed),
+        retrieval_hit_count,
+    }
+}
+
+fn external_evidence_allowed(
+    evidence: &crate::repository::PersistedEvidence,
+    current: Option<&crate::repository::PersistedRetrievalBundle>,
+) -> bool {
+    if evidence.origin_location == "user" {
+        return true;
+    }
+    if evidence.origin_location == "knowledge" {
+        return current.is_some_and(|retrieval| {
+            retrieval.bundle.cloud_authorized && evidence.retrieval_bundle_id.as_deref() == Some(retrieval.id.as_str())
+        });
+    }
+    if !evidence.cloud_egress_allowed {
+        return false;
+    }
+    if evidence.lineage_bundle_ids.is_empty() {
+        return true;
+    }
+    current.is_some_and(|retrieval| {
+        retrieval.bundle.cloud_authorized
+            && evidence
+                .lineage_bundle_ids
+                .iter()
+                .all(|bundle_id| bundle_id == &retrieval.id)
+    })
+}
+
+fn location_label(location: BrainLocation) -> &'static str {
+    match location {
+        BrainLocation::Local => "local",
+        BrainLocation::External => "external",
+        BrainLocation::Unknown => "unknown",
+    }
+}
+
 fn normalize_user_notes(evidence: Vec<DecisionEvidenceInput>) -> Vec<DecisionEvidenceInput> {
     evidence
         .into_iter()
@@ -1004,6 +1280,8 @@ fn normalize_user_notes(evidence: Vec<DecisionEvidenceInput>) -> Vec<DecisionEvi
                 page: None,
                 chapter: None,
                 timestamp_ms: None,
+                end_seconds: None,
+                uri: None,
             })
         })
         .collect()
@@ -1036,6 +1314,8 @@ fn evidence_event_payload(hit: &DecisionEvidenceInput) -> serde_json::Value {
             "page": hit.page,
             "chapter": hit.chapter,
             "start_seconds": hit.timestamp_ms.map(|value| value as f64 / 1_000.0),
+            "end_seconds": hit.end_seconds,
+            "uri": hit.uri,
         }
     })
 }
@@ -1045,7 +1325,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
-    use aionui_api_types::{BrainKind, CreateDecisionRequest, DecisionStatus};
+    use aionui_api_types::{BrainKind, CreateDecisionRequest, DecisionStatus, RetrievalBundle};
     use aionui_db::init_database_memory;
     use aionui_realtime::EventBroadcaster;
 
@@ -1054,21 +1334,49 @@ mod tests {
     #[derive(Clone)]
     struct MockBrainRuntime {
         catalog: Vec<BrainDefinition>,
+        catalog_available: Arc<AtomicBool>,
+        force_external: Arc<AtomicBool>,
         ready: Arc<AtomicBool>,
         calls: Arc<StdMutex<HashMap<String, usize>>>,
+        invocations: Arc<StdMutex<Vec<BrainInvocation>>>,
         recover_failures: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
     impl BrainCatalogPort for MockBrainRuntime {
         async fn available_brains(&self) -> Result<Vec<BrainDefinition>, BrainExecutionFailure> {
+            if !self.catalog_available.load(Ordering::SeqCst) {
+                return Err(BrainExecutionFailure::new(
+                    BrainExecutionFailureKind::Unavailable,
+                    "scripted catalog outage",
+                ));
+            }
             Ok(self.catalog.clone())
         }
     }
 
     #[async_trait::async_trait]
     impl BrainExecutionPort for MockBrainRuntime {
-        async fn execute(&self, invocation: BrainInvocation) -> Result<BrainOpinion, BrainExecutionFailure> {
+        async fn prepare(&self, brain: &BrainDefinition) -> Result<crate::BrainExecutionPlan, BrainExecutionFailure> {
+            let location = if self.force_external.load(Ordering::SeqCst) {
+                BrainLocation::External
+            } else if brain.provider_id.starts_with("local") {
+                BrainLocation::Local
+            } else if brain.provider_id.starts_with("unknown") {
+                BrainLocation::Unknown
+            } else {
+                BrainLocation::External
+            };
+            Ok(crate::BrainExecutionPlan::new(brain.clone(), location, ()))
+        }
+
+        async fn execute(
+            &self,
+            plan: crate::BrainExecutionPlan,
+            invocation: BrainInvocation,
+        ) -> Result<BrainOpinion, BrainExecutionFailure> {
+            assert_eq!(plan.brain, invocation.brain);
+            self.invocations.lock().unwrap().push(invocation.clone());
             *self
                 .calls
                 .lock()
@@ -1090,7 +1398,7 @@ mod tests {
                     BrainExecutionFailureKind::RateLimited,
                     "scripted 429",
                 )),
-                provider if provider.starts_with("wait") => {
+                provider if provider.contains("wait") => {
                     while !self.ready.load(Ordering::SeqCst) {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -1122,18 +1430,52 @@ mod tests {
         async fn retrieve(
             &self,
             request: DecisionKnowledgeRequest,
-        ) -> Result<Vec<DecisionEvidenceInput>, crate::DecisionKnowledgeFailure> {
-            self.calls.lock().unwrap().push(request);
-            Ok(vec![DecisionEvidenceInput {
+        ) -> Result<DecisionKnowledgeResult, crate::DecisionKnowledgeFailure> {
+            let cloud_authorized = request
+                .policy
+                .get("cloud_use")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let generation = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(request);
+                calls.len()
+            };
+            let snippet = format!("Retention improved by 12 percent · retrieval {generation}");
+            let evidence = vec![DecisionEvidenceInput {
                 source_id: "source-1".into(),
                 title: "Pilot results".into(),
-                snippet: "Retention improved by 12 percent".into(),
+                snippet: snippet.clone(),
                 score: 0.91,
                 media_type: "pdf".into(),
                 page: Some(3),
                 chapter: None,
                 timestamp_ms: None,
-            }])
+                end_seconds: Some(18.25),
+                uri: Some("contextofme://knowledge/wiki/pilot-results".into()),
+            }];
+            Ok(DecisionKnowledgeResult {
+                retrieval: Some(RetrievalBundle {
+                    query: "Should we launch this month?".into(),
+                    hits: vec![aionui_api_types::KnowledgeHit {
+                        source_id: "source-1".into(),
+                        title: "Pilot results".into(),
+                        snippet,
+                        score: 0.91,
+                        media_type: "pdf".into(),
+                        locator: aionui_api_types::KnowledgeLocator {
+                            page: Some(3),
+                            end_seconds: Some(18.25),
+                            uri: Some("contextofme://knowledge/wiki/pilot-results".into()),
+                            ..Default::default()
+                        },
+                    }],
+                    token_budget: 16,
+                    cloud_authorized,
+                    space_ids: vec!["personal".into()],
+                }),
+                evidence,
+            })
         }
     }
 
@@ -1157,6 +1499,7 @@ mod tests {
 
     fn request(brains: Vec<BrainDefinition>) -> CreateDecisionRequest {
         CreateDecisionRequest {
+            client_operation_id: None,
             question: "Should we launch this month?".into(),
             brain_count: brains.len(),
             brains,
@@ -1172,6 +1515,8 @@ mod tests {
                 page: Some(99),
                 chapter: None,
                 timestamp_ms: None,
+                end_seconds: None,
+                uri: None,
             }],
         }
     }
@@ -1183,8 +1528,11 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let runtime = Arc::new(MockBrainRuntime {
             catalog,
+            catalog_available: Arc::new(AtomicBool::new(true)),
+            force_external: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(ready)),
             calls: Arc::new(StdMutex::new(HashMap::new())),
+            invocations: Arc::new(StdMutex::new(Vec::new())),
             recover_failures: Arc::new(AtomicBool::new(false)),
         });
         let events = Arc::new(RecordingBroadcaster::default());
@@ -1242,6 +1590,12 @@ mod tests {
         assert!(!completed.evidence.iter().any(|hit| hit.source_id == "forged-source"));
         assert!(completed.evidence.iter().any(|hit| hit.media_type == "user_note"));
         assert!(completed.evidence.iter().any(|hit| hit.media_type == "ai_opinion"));
+        let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decision_egress_audit WHERE decision_id = ?")
+            .bind(&created.id)
+            .fetch_one(service.repository.pool())
+            .await
+            .unwrap();
+        assert!(audit_rows >= 5, "each retry/fallback attempt must be audited");
         {
             let calls = runtime.calls.lock().unwrap();
             assert!(calls["timeout"] >= 2);
@@ -1275,6 +1629,313 @@ mod tests {
         );
         assert!(!recovered.resolution.as_ref().unwrap().partial);
         assert!(recovered.session.as_ref().unwrap().revision >= 2);
+    }
+
+    #[tokio::test]
+    async fn retrieval_is_gated_per_actual_brain_location_in_local_cloud_and_mixed_runs() {
+        let mixed = vec![
+            brain("local-ollama", "local-one", "strategy"),
+            brain("cloud-one", "cloud-one", "risk"),
+            brain("local-llamacpp", "local-two", "product"),
+        ];
+        let (service, runtime, _events) = harness(mixed.clone(), true).await;
+        let created = service.create("system_default_user", request(mixed)).await.unwrap();
+        service.start("system_default_user", &created.id).await.unwrap();
+        wait_for_terminal(&service, &created.id).await;
+
+        {
+            let invocations = runtime.invocations.lock().unwrap();
+            for invocation in invocations.iter() {
+                let has_retrieval = invocation.evidence.iter().any(|item| item.source_id == "source-1");
+                let has_owner_note = invocation.evidence.iter().any(|item| item.media_type == "user_note");
+                assert!(
+                    has_owner_note,
+                    "explicit owner notes remain available to every selected Brain"
+                );
+                if invocation.brain.provider_id.starts_with("local") {
+                    assert!(has_retrieval, "local Brain lost locally retrieved evidence");
+                } else {
+                    assert!(!has_retrieval, "unauthorized cloud Brain received personal knowledge");
+                }
+            }
+        }
+
+        let audits: Vec<(String, bool, i64)> = sqlx::query_as(
+            "SELECT location, knowledge_egress_allowed, hit_count FROM decision_egress_audit \
+             WHERE decision_id = ? ORDER BY created_at",
+        )
+        .bind(&created.id)
+        .fetch_all(service.repository.pool())
+        .await
+        .unwrap();
+        assert!(audits.iter().any(|row| row.0 == "local" && !row.1 && row.2 == 1));
+        assert!(audits.iter().any(|row| row.0 == "external" && !row.1 && row.2 == 0));
+
+        let cloud = vec![
+            brain("cloud-a", "a", "strategy"),
+            brain("cloud-b", "b", "risk"),
+            brain("cloud-c", "c", "product"),
+        ];
+        let (service, runtime, _events) = harness(cloud.clone(), true).await;
+        let created = service.create("system_default_user", request(cloud)).await.unwrap();
+        service.start("system_default_user", &created.id).await.unwrap();
+        wait_for_terminal(&service, &created.id).await;
+        assert!(
+            runtime
+                .invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|invocation| { !invocation.evidence.iter().any(|item| item.source_id == "source-1") })
+        );
+
+        let local = vec![
+            brain("local-a", "a", "strategy"),
+            brain("local-b", "b", "risk"),
+            brain("local-c", "c", "product"),
+        ];
+        let (service, runtime, _events) = harness(local.clone(), true).await;
+        let created = service.create("system_default_user", request(local)).await.unwrap();
+        service.start("system_default_user", &created.id).await.unwrap();
+        wait_for_terminal(&service, &created.id).await;
+        assert!(
+            runtime
+                .invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|invocation| { invocation.evidence.iter().any(|item| item.source_id == "source-1") })
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_continue_and_recovery_keep_old_knowledge_and_local_opinions_off_cloud() {
+        let brains = vec![
+            brain("local-a", "one", "strategy"),
+            brain("local-b", "two", "risk"),
+            brain("local-wait", "three", "product"),
+        ];
+        let (service, runtime, events) = harness(brains.clone(), false).await;
+        let created = service.create("system_default_user", request(brains)).await.unwrap();
+        service.start("system_default_user", &created.id).await.unwrap();
+
+        for _ in 0..200 {
+            if service
+                .get("system_default_user", &created.id)
+                .await
+                .unwrap()
+                .candidates
+                .len()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            service
+                .get("system_default_user", &created.id)
+                .await
+                .unwrap()
+                .candidates
+                .len(),
+            2
+        );
+        service.pause("system_default_user", &created.id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let local_tainted_opinions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decision_evidence WHERE decision_id = ? AND media_type = 'ai_opinion' \
+             AND origin_location = 'local' AND cloud_egress_allowed = 0",
+        )
+        .bind(&created.id)
+        .fetch_one(service.repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(local_tainted_opinions, 2);
+
+        // Simulate a new Core process after recovery plus a provider update
+        // that changes the remaining Brain's actual execution boundary.
+        runtime.force_external.store(true, Ordering::SeqCst);
+        runtime.ready.store(true, Ordering::SeqCst);
+        let recovered_service = DecisionService::with_timeout_and_knowledge(
+            service.repository.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            events,
+            Arc::new(MockKnowledge::default()),
+            Duration::from_secs(2),
+        );
+        recovered_service
+            .continue_decision("system_default_user", &created.id)
+            .await
+            .unwrap();
+        let completed = wait_for_terminal(&recovered_service, &created.id).await;
+        assert!(completed.session.as_ref().unwrap().revision >= 2);
+
+        let recovered_invocation = runtime
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|invocation| invocation.brain.provider_id == "local-wait")
+            .cloned()
+            .unwrap();
+        assert!(
+            recovered_invocation
+                .evidence
+                .iter()
+                .all(|evidence| evidence.media_type == "user_note"),
+            "external recovery received old retrieval evidence or a local-derived opinion"
+        );
+
+        let (same_source_rows, distinct_lineages): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(DISTINCT retrieval_bundle_id) FROM decision_evidence \
+             WHERE decision_id = ? AND source_id = 'source-1'",
+        )
+        .bind(&created.id)
+        .fetch_one(recovered_service.repository.pool())
+        .await
+        .unwrap();
+        assert!(same_source_rows >= 3);
+        assert_eq!(same_source_rows, distinct_lineages);
+
+        let external_audit: (bool, i64, String, String) = sqlx::query_as(
+            "SELECT knowledge_egress_allowed, hit_count, evidence_ids_json, lineage_bundle_ids_json \
+             FROM decision_egress_audit WHERE decision_id = ? AND provider_id = 'local-wait' \
+             AND location = 'external' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&created.id)
+        .fetch_one(recovered_service.repository.pool())
+        .await
+        .unwrap();
+        assert!(!external_audit.0);
+        assert_eq!(external_audit.1, 0);
+        assert_ne!(
+            external_audit.2, "[]",
+            "owner note lineage should identify its evidence row"
+        );
+        assert_eq!(external_audit.3, "[]");
+    }
+
+    #[tokio::test]
+    async fn authorized_bundle_reaches_cloud_brains_and_is_persisted() {
+        let brains = vec![
+            brain("cloud-a", "a", "strategy"),
+            brain("cloud-b", "b", "risk"),
+            brain("cloud-c", "c", "product"),
+        ];
+        let (service, runtime, _events) = harness(brains.clone(), true).await;
+        let mut create = request(brains);
+        create.knowledge = json!({"mode": "auto", "cloud_use": true, "space_ids": ["personal"]});
+        let created = service.create("system_default_user", create).await.unwrap();
+        service.start("system_default_user", &created.id).await.unwrap();
+        let completed = wait_for_terminal(&service, &created.id).await;
+        assert!(
+            runtime
+                .invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|invocation| { invocation.evidence.iter().any(|item| item.source_id == "source-1") })
+        );
+        let bundle: (bool, String) = sqlx::query_as(
+            "SELECT cloud_authorized, space_ids_json FROM decision_retrieval_bundles \
+             WHERE decision_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&created.id)
+        .fetch_one(service.repository.pool())
+        .await
+        .unwrap();
+        assert!(bundle.0);
+        assert_eq!(bundle.1, r#"["personal"]"#);
+        let allowed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decision_egress_audit WHERE decision_id = ? AND knowledge_egress_allowed = 1",
+        )
+        .bind(&created.id)
+        .fetch_one(service.repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(allowed, 3);
+        let hit = completed
+            .evidence
+            .iter()
+            .find(|evidence| evidence.source_id == "source-1")
+            .unwrap();
+        assert_eq!(hit.locator.end_seconds, Some(18.25));
+        assert_eq!(
+            hit.locator.uri.as_deref(),
+            Some("contextofme://knowledge/wiki/pilot-results")
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_create_idempotency_survives_lost_ack_is_user_scoped_and_detects_conflicts() {
+        let brains = vec![
+            brain("local-a", "a", "strategy"),
+            brain("local-b", "b", "risk"),
+            brain("local-c", "c", "product"),
+        ];
+        let (service, _runtime, _events) = harness(brains.clone(), true).await;
+        let mut create = request(brains.clone());
+        create.client_operation_id = Some("client-op-0001".into());
+        let first = service.create("system_default_user", create.clone()).await.unwrap();
+        let retry = service.create("system_default_user", create.clone()).await.unwrap();
+        assert_eq!(first.id, retry.id);
+        assert_eq!(service.list("system_default_user").await.unwrap().len(), 1);
+
+        let mut mismatched = create.clone();
+        mismatched.client_operation_id = Some("client-op-body".into());
+        assert!(matches!(
+            service
+                .create_with_idempotency("system_default_user", mismatched, Some("client-op-header"))
+                .await,
+            Err(DecisionError::Conflict(_))
+        ));
+        let mut malformed = request(brains);
+        malformed.client_operation_id = Some("short".into());
+        assert!(matches!(
+            service.create("system_default_user", malformed).await,
+            Err(DecisionError::InvalidRequest(_))
+        ));
+
+        let mut conflict = create.clone();
+        conflict.question = "A materially different decision question".into();
+        assert!(matches!(
+            service.create("system_default_user", conflict).await,
+            Err(DecisionError::Conflict(_))
+        ));
+
+        let now = aionui_common::now_ms();
+        sqlx::query("INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, '', ?, ?)")
+            .bind("other-user")
+            .bind("other-user")
+            .bind(now)
+            .bind(now)
+            .execute(service.repository.pool())
+            .await
+            .unwrap();
+        let other = service.create("other-user", create).await.unwrap();
+        assert_ne!(first.id, other.id);
+    }
+
+    #[tokio::test]
+    async fn idempotent_auto_brain_retry_does_not_depend_on_the_current_catalog() {
+        let catalog = vec![
+            brain("local-a", "a", "strategy"),
+            brain("local-b", "b", "risk"),
+            brain("local-c", "c", "product"),
+        ];
+        let (service, runtime, _events) = harness(catalog, true).await;
+        let mut create = request(vec![]);
+        create.brain_count = 3;
+        create.client_operation_id = Some("auto-brain-op-0001".into());
+        let first = service.create("system_default_user", create.clone()).await.unwrap();
+
+        runtime.catalog_available.store(false, Ordering::SeqCst);
+        let retry = service.create("system_default_user", create).await.unwrap();
+        assert_eq!(first.id, retry.id);
     }
 
     #[tokio::test]

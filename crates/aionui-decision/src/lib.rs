@@ -9,8 +9,9 @@ mod service;
 
 pub use error::DecisionError;
 pub use ports::{
-    BrainCatalogPort, BrainExecutionFailure, BrainExecutionFailureKind, BrainExecutionPort, BrainInvocation,
-    BrainOpinion, DecisionKnowledgeFailure, DecisionKnowledgePort, DecisionKnowledgeRequest, NoopDecisionKnowledge,
+    BrainCatalogPort, BrainExecutionFailure, BrainExecutionFailureKind, BrainExecutionPlan, BrainExecutionPort,
+    BrainInvocation, BrainLocation, BrainOpinion, DecisionKnowledgeFailure, DecisionKnowledgePort,
+    DecisionKnowledgeRequest, DecisionKnowledgeResult, NoopDecisionKnowledge,
 };
 pub use provider_executor::ProviderBrainRuntime;
 pub use repository::DecisionRepository;

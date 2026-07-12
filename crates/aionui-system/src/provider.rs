@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use aionui_api_types::{CreateProviderRequest, ProviderResponse, UpdateProviderRequest};
+use aionui_common::outbound::{is_numeric_loopback, is_public_outbound_address};
 use aionui_common::{decrypt_string, encrypt_string};
 use aionui_db::{CreateProviderParams, IProviderRepository, UpdateProviderParams, models::Provider};
 use serde::de::DeserializeOwned;
@@ -71,21 +72,22 @@ impl ProviderService {
 
     /// Update an existing provider. Only provided fields are changed.
     pub async fn update(&self, id: &str, req: UpdateProviderRequest) -> Result<ProviderResponse, SystemError> {
-        let platform = if req.base_url.is_some() {
-            match req.platform.as_deref() {
-                Some(platform) => Some(platform.to_owned()),
-                None => Some(
-                    self.repo
-                        .find_by_id(id)
-                        .await?
-                        .ok_or_else(|| SystemError::NotFound(format!("Provider {id} not found")))?
-                        .platform,
-                ),
-            }
+        let endpoint_changed = req.base_url.is_some() || req.platform.is_some();
+        let existing = if endpoint_changed {
+            Some(
+                self.repo
+                    .find_by_id(id)
+                    .await?
+                    .ok_or_else(|| SystemError::NotFound(format!("Provider {id} not found")))?,
+            )
         } else {
-            req.platform.clone()
+            None
         };
-        validate_update_request(&req, platform.as_deref())?;
+        let effective_platform = req
+            .platform
+            .as_deref()
+            .or_else(|| existing.as_ref().map(|provider| provider.platform.as_str()));
+        validate_update_request(&req, effective_platform)?;
 
         let encrypted_key = req
             .api_key
@@ -351,29 +353,31 @@ fn reject_masked_secret_write(value: &str, field: &str) -> Result<(), SystemErro
 }
 
 pub(crate) fn validate_provider_base_url(platform: &str, url: &str) -> Result<(), SystemError> {
-    let (parsed, host, ip) = parse_provider_endpoint(url)?;
+    let (parsed, _host, ip) = parse_provider_endpoint(url)?;
     let local_platform = is_local_platform(platform);
-    let loopback = host == "localhost" || ip.is_some_and(|address| address.is_loopback());
+    let loopback = ip.is_some_and(is_numeric_loopback);
     if local_platform && !loopback {
         return Err(SystemError::BadRequest(
-            "local provider baseUrl must use loopback".into(),
+            "local provider baseUrl must use a numeric loopback address".into(),
         ));
     }
-    if !local_platform && loopback {
+    if !local_platform && ip.is_some_and(|address| !is_public_outbound_address(address)) {
         return Err(SystemError::BadRequest(
-            "loopback baseUrl requires an explicit local provider platform".into(),
+            "external provider baseUrl must use a publicly routable host".into(),
         ));
     }
-    require_encrypted_public_transport(&parsed, &host, ip, loopback)
+    require_encrypted_public_transport(&parsed, local_platform)
 }
 
 /// Validate a pre-save protocol probe. Loopback is allowed because detection
 /// is also used for local servers, but metadata/link-local targets and public
 /// cleartext endpoints remain forbidden.
 pub(crate) fn validate_provider_probe_base_url(url: &str) -> Result<(), SystemError> {
-    let (parsed, host, ip) = parse_provider_endpoint(url)?;
-    let loopback = host == "localhost" || ip.is_some_and(|address| address.is_loopback());
-    require_encrypted_public_transport(&parsed, &host, ip, loopback)
+    let (parsed, _host, ip) = parse_provider_endpoint(url)?;
+    if ip.is_some_and(|address| !is_numeric_loopback(address) && !is_public_outbound_address(address)) {
+        return Err(SystemError::BadRequest("baseUrl host is not allowed".into()));
+    }
+    require_encrypted_public_transport(&parsed, ip.is_some_and(is_numeric_loopback))
 }
 
 fn parse_provider_endpoint(url: &str) -> Result<(reqwest::Url, String, Option<IpAddr>), SystemError> {
@@ -395,51 +399,20 @@ fn parse_provider_endpoint(url: &str) -> Result<(reqwest::Url, String, Option<Ip
     }
 
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let ip = host.parse::<IpAddr>().ok();
-    if ip.is_some_and(forbidden_ip) {
-        return Err(SystemError::BadRequest("baseUrl host is not allowed".into()));
-    }
+    let ip = host
+        .trim_matches(|character| matches!(character, '[' | ']'))
+        .parse::<IpAddr>()
+        .ok();
     Ok((parsed, host, ip))
 }
 
-fn require_encrypted_public_transport(
-    parsed: &reqwest::Url,
-    host: &str,
-    ip: Option<IpAddr>,
-    loopback: bool,
-) -> Result<(), SystemError> {
-    let private_transport = ip.is_some_and(private_provider_ip) || host.ends_with(".local") || loopback;
-    if parsed.scheme() == "http" && !private_transport {
+fn require_encrypted_public_transport(parsed: &reqwest::Url, local: bool) -> Result<(), SystemError> {
+    if parsed.scheme() == "http" && !local {
         return Err(SystemError::BadRequest(
-            "non-private provider baseUrl must use https".into(),
+            "external provider baseUrl must use https".into(),
         ));
     }
     Ok(())
-}
-
-fn forbidden_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            address.is_unspecified()
-                || address.is_link_local()
-                || address.is_multicast()
-                || address == Ipv4Addr::BROADCAST
-        }
-        IpAddr::V6(address) => address.is_unspecified() || address.is_unicast_link_local() || address.is_multicast(),
-    }
-}
-
-fn private_provider_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            (segments[0] & 0xfe00) == 0xfc00 || address == Ipv6Addr::LOCALHOST
-        }
-    }
 }
 
 #[cfg(test)]
@@ -653,8 +626,10 @@ mod tests {
 
     #[test]
     fn validate_base_url_http() {
-        assert!(validate_provider_base_url("ollama", "http://localhost:8080").is_ok());
-        assert!(validate_provider_base_url("new-api", "http://192.168.1.5:3000/v1").is_ok());
+        assert!(validate_provider_base_url("ollama", "http://127.0.0.1:8080").is_ok());
+        assert!(validate_provider_base_url("ollama", "http://[::1]:8080").is_ok());
+        assert!(validate_provider_base_url("ollama", "http://localhost:8080").is_err());
+        assert!(validate_provider_base_url("new-api", "http://192.168.1.5:3000/v1").is_err());
     }
 
     #[test]

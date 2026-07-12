@@ -2,12 +2,14 @@ mod fetchers;
 mod url_fixer;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aionui_api_types::{BedrockConfig, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse};
 use aionui_common::decrypt_string;
 use aionui_db::IProviderRepository;
 
 use crate::error::SystemError;
+use crate::outbound_http::resolve_provider_endpoint;
 use crate::provider::{deserialize_opt, validate_provider_base_url};
 
 /// Internal configuration extracted from a provider row for model fetching.
@@ -32,7 +34,7 @@ fn extract_first_key(api_key: &str) -> String {
 pub struct ModelFetchService {
     repo: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
-    http_client: reqwest::Client,
+    fallback_http_client: reqwest::Client,
 }
 
 impl ModelFetchService {
@@ -40,7 +42,7 @@ impl ModelFetchService {
         Self {
             repo,
             encryption_key,
-            http_client,
+            fallback_http_client: http_client,
         }
     }
 
@@ -76,13 +78,21 @@ impl ModelFetchService {
     /// Shared fetch+try_fix branch used by both the by-id and anonymous
     /// entry points.
     async fn fetch_with_config(&self, config: &FetchConfig, try_fix: bool) -> Result<FetchModelsResponse, SystemError> {
-        match fetchers::fetch_for_platform(&self.http_client, config).await {
+        let pinned = if platform_uses_http(&config.platform) {
+            Some(resolve_provider_endpoint(&config.platform, &config.base_url, Duration::from_secs(30)).await?)
+        } else {
+            None
+        };
+        let client = pinned
+            .as_ref()
+            .map_or(&self.fallback_http_client, |endpoint| &endpoint.client);
+        match fetchers::fetch_for_platform(client, config).await {
             Ok(models) => Ok(FetchModelsResponse {
                 models,
                 fixed_base_url: None,
             }),
             Err(err) if try_fix && supports_url_fix(&config.platform) => {
-                url_fixer::try_fix_url(&self.http_client, config).await.map_err(|_| err)
+                url_fixer::try_fix_url(client, config).await.map_err(|_| err)
             }
             Err(err) => Err(err),
         }
@@ -144,6 +154,10 @@ fn supports_url_fix(platform: &str) -> bool {
         platform,
         "anthropic" | "claude" | "gemini" | "bedrock" | "vertex-ai" | "minimax" | "dashscope-coding"
     )
+}
+
+fn platform_uses_http(platform: &str) -> bool {
+    !matches!(platform, "bedrock" | "vertex-ai" | "minimax")
 }
 
 #[cfg(test)]
@@ -288,6 +302,17 @@ mod tests {
         let req = FetchModelsRequest { try_fix: false };
         let err = svc.fetch_models("no_such_id", &req).await.unwrap_err();
         assert!(matches!(err, SystemError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_revalidates_legacy_provider_endpoints_at_use_time() {
+        let (svc, db) = setup().await;
+        let id = create_provider(&db, "openai", "http://169.254.169.254/latest/meta-data", "legacy-key").await;
+        let error = svc
+            .fetch_models(&id, &FetchModelsRequest { try_fix: true })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SystemError::BadRequest(_)));
     }
 
     #[tokio::test]

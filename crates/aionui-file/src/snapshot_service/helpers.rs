@@ -160,7 +160,9 @@ pub(super) fn init_snapshot_repo(workspace: &Path, temp_dir: &Path) -> Result<()
 /// Get the current branch name from a repository.
 /// Returns `None` if HEAD is detached or the repo has no commits.
 pub(super) fn current_branch(repo: &Repository) -> Option<String> {
-    repo.head().ok().and_then(|head| head.shorthand().map(String::from))
+    repo.head()
+        .ok()
+        .and_then(|head| head.shorthand().ok().map(String::from))
 }
 
 /// Build a `SnapshotInfo` from mode and repository.
@@ -216,8 +218,8 @@ pub(super) fn parse_statuses(repo: &Repository, workspace: &Path) -> Result<Comp
     for entry in statuses.iter() {
         let status = entry.status();
         let rel_path = match entry.path() {
-            Some(p) => p.to_string(),
-            None => continue,
+            Ok(path) => path.to_string(),
+            Err(_) => continue,
         };
         let full_path = format!("{}/{}", ws_str.trim_end_matches('/'), &rel_path);
 
@@ -301,7 +303,7 @@ pub(super) fn stage_all_with_deletions(repo: &Repository) -> Result<(), FileErro
         .map_err(|e| FileError::Internal(format!("Failed to get status: {}", e)))?;
     for entry in statuses.iter() {
         if entry.status().intersects(Status::WT_DELETED)
-            && let Some(path) = entry.path()
+            && let Ok(path) = entry.path()
         {
             index.remove_path(Path::new(path)).map_err(|e| {
                 FileError::Internal(format!("Failed to remove deleted file {} from index: {}", path, e))

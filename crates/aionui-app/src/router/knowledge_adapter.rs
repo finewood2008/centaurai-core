@@ -4,7 +4,9 @@ use std::sync::Arc;
 use aionui_api_types::{DecisionEvidenceInput, KnowledgeHit, KnowledgeSearchMode, KnowledgeSearchRequest};
 use aionui_conversation::ConversationService;
 use aionui_db::IProviderRepository;
-use aionui_decision::{DecisionKnowledgeFailure, DecisionKnowledgePort, DecisionKnowledgeRequest};
+use aionui_decision::{
+    DecisionKnowledgeFailure, DecisionKnowledgePort, DecisionKnowledgeRequest, DecisionKnowledgeResult,
+};
 use aionui_knowledge::{KnowledgeGateway, ModelLocation, ModelLocationResolver};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -75,7 +77,7 @@ impl DecisionKnowledgePort for AppDecisionKnowledge {
     async fn retrieve(
         &self,
         request: DecisionKnowledgeRequest,
-    ) -> Result<Vec<DecisionEvidenceInput>, DecisionKnowledgeFailure> {
+    ) -> Result<DecisionKnowledgeResult, DecisionKnowledgeFailure> {
         let policy = if request.policy.is_null() {
             DecisionKnowledgePolicy::default()
         } else {
@@ -84,27 +86,44 @@ impl DecisionKnowledgePort for AppDecisionKnowledge {
         };
         let _ = policy.mode;
 
-        // Decisions may fan evidence out to multiple provider brains. Until
-        // every configured brain can be proven local, explicit cloud consent
-        // is required before retrieval so local passages cannot leak through
-        // a later provider invocation.
-        if !policy.cloud_use {
-            return Ok(Vec::new());
+        if policy.mode.as_deref() == Some("off") {
+            return Ok(DecisionKnowledgeResult::default());
         }
 
-        let bundle = self
+        // Retrieve locally first. Cloud authorization is evaluated separately
+        // and persisted on the bundle; the Decision service gates that bundle
+        // again for each concrete Brain/fallback execution location.
+        let mut bundle = self
             .gateway
             .search(KnowledgeSearchRequest {
                 query: request.question,
                 mode: KnowledgeSearchMode::Hybrid,
-                space_ids: policy.space_ids,
+                space_ids: policy.space_ids.clone(),
                 max_hits: policy.max_hits,
-                cloud_use: true,
+                cloud_use: false,
                 media_type: None,
             })
             .await
             .map_err(|error| DecisionKnowledgeFailure::new(error.public_message()))?;
-        Ok(bundle.hits.into_iter().map(hit_to_decision_evidence).collect())
+        bundle.cloud_authorized = if policy.cloud_use {
+            match self.gateway.cloud_authorized(&policy.space_ids).await {
+                Ok(authorized) => authorized,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "decision cloud-consent check failed closed; local retrieval remains available"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let evidence = bundle.hits.iter().cloned().map(hit_to_decision_evidence).collect();
+        Ok(DecisionKnowledgeResult {
+            evidence,
+            retrieval: Some(bundle),
+        })
     }
 }
 
@@ -121,6 +140,8 @@ fn hit_to_decision_evidence(hit: KnowledgeHit) -> DecisionEvidenceInput {
             .locator
             .start_seconds
             .map(|seconds| (seconds * 1_000.0).round() as i64),
+        end_seconds: hit.locator.end_seconds,
+        uri: hit.locator.uri,
     }
 }
 
@@ -135,22 +156,26 @@ fn is_local_provider(platform: &str, base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
     };
-    match url.host_str() {
-        Some("localhost") => true,
-        Some(host) => host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback()),
-        None => false,
-    }
+    url.host_str()
+        .and_then(|host| {
+            host.trim_matches(|character| matches!(character, '[' | ']'))
+                .parse::<IpAddr>()
+                .ok()
+        })
+        .is_some_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aionui_api_types::KnowledgeLocator;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn only_explicit_local_provider_targets_are_local() {
         assert!(is_local_provider("ollama", "http://127.0.0.1:11434"));
-        assert!(is_local_provider("local", "http://localhost:11434/v1"));
+        assert!(!is_local_provider("local", "http://localhost:11434/v1"));
         assert!(!is_local_provider("ollama", "http://example.com"));
         assert!(!is_local_provider("openai", "http://127.0.0.1:11434/v1"));
         assert!(!is_local_provider("openai", "https://api.openai.com/v1"));
@@ -158,18 +183,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decision_retrieval_requires_explicit_cloud_authorization() {
-        let adapter = AppDecisionKnowledge::new(Arc::new(KnowledgeGateway::unavailable()));
+    async fn decision_retrieval_remains_available_locally_without_cloud_authorization() {
+        let worker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/knowledge/search"))
+            .and(body_json(serde_json::json!({
+                "query": "private question",
+                "mode": "hybrid",
+                "space_ids": ["personal"],
+                "max_hits": 8,
+                "cloud_use": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "private question",
+                "hits": [{
+                    "source_id": "source-one", "title": "Private", "snippet": "local evidence",
+                    "score": 0.9, "media_type": "text", "locator": {}
+                }],
+                "token_budget": 0,
+                "cloud_authorized": false,
+                "space_ids": ["personal"]
+            })))
+            .expect(1)
+            .mount(&worker)
+            .await;
+        let gateway = KnowledgeGateway::for_loopback_worker(
+            &worker.uri(),
+            "internal-token",
+            Arc::new(aionui_knowledge::UnknownModelLocationResolver),
+        )
+        .unwrap();
+        let adapter = AppDecisionKnowledge::new(Arc::new(gateway));
         let evidence = adapter
             .retrieve(DecisionKnowledgeRequest {
                 user_id: "owner".into(),
                 decision_id: None,
                 question: "private question".into(),
-                policy: serde_json::json!({"mode": "auto", "cloud_use": false}),
+                policy: serde_json::json!({
+                    "mode": "auto", "cloud_use": false, "space_ids": ["personal"]
+                }),
             })
             .await
             .unwrap();
-        assert!(evidence.is_empty());
+        assert_eq!(evidence.evidence[0].source_id, "source-one");
+        assert!(!evidence.retrieval.unwrap().cloud_authorized);
+    }
+
+    #[tokio::test]
+    async fn cloud_consent_lookup_failure_does_not_suppress_local_decision_evidence() {
+        let worker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/knowledge/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "private question",
+                "hits": [{
+                    "source_id": "source-one", "title": "Private", "snippet": "local evidence",
+                    "score": 0.9, "media_type": "text", "locator": {}
+                }],
+                "token_budget": 0,
+                "cloud_authorized": false,
+                "space_ids": ["personal"]
+            })))
+            .expect(1)
+            .mount(&worker)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/knowledge/spaces"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("private worker error"))
+            .expect(1)
+            .mount(&worker)
+            .await;
+        let gateway = KnowledgeGateway::for_loopback_worker(
+            &worker.uri(),
+            "internal-token",
+            Arc::new(aionui_knowledge::UnknownModelLocationResolver),
+        )
+        .unwrap();
+        let result = AppDecisionKnowledge::new(Arc::new(gateway))
+            .retrieve(DecisionKnowledgeRequest {
+                user_id: "owner".into(),
+                decision_id: None,
+                question: "private question".into(),
+                policy: serde_json::json!({
+                    "mode": "auto", "cloud_use": true, "space_ids": ["personal"]
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.evidence[0].source_id, "source-one");
+        assert!(!result.retrieval.unwrap().cloud_authorized);
     }
 
     #[tokio::test]
@@ -203,12 +305,14 @@ mod tests {
                 page: Some(4),
                 chapter: Some("Risk".into()),
                 start_seconds: Some(12.345),
-                end_seconds: None,
-                uri: None,
+                end_seconds: Some(18.25),
+                uri: Some("contextofme://knowledge/wiki/plan/risk".into()),
             },
         });
         assert_eq!(evidence.page, Some(4));
         assert_eq!(evidence.chapter.as_deref(), Some("Risk"));
         assert_eq!(evidence.timestamp_ms, Some(12_345));
+        assert_eq!(evidence.end_seconds, Some(18.25));
+        assert_eq!(evidence.uri.as_deref(), Some("contextofme://knowledge/wiki/plan/risk"));
     }
 }

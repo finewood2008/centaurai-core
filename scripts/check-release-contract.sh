@@ -24,6 +24,7 @@ if [[ -n "$release_tag" ]]; then
 fi
 
 bash scripts/check-centaurai-identity.sh
+bash scripts/check-workflow-actions-pinned.sh
 bash scripts/check-glibc-workflow-config.test.sh
 
 release_workflow=".github/workflows/release.yml"
@@ -58,6 +59,22 @@ grep -Fq 'centaurai-core-release.json' "$release_workflow" \
   || fail "release provenance manifest is missing"
 grep -Fq '"commit": os.environ["SOURCE_COMMIT"]' "$release_workflow" \
   || fail "release manifest does not record the source commit"
+grep -Fq 'CENTAURAI_CORE_LISTENING' "$release_workflow" \
+  || fail "release workflow does not validate the launched binary listening contract"
+grep -Fq '/api/capabilities' "$release_workflow" \
+  || fail "release workflow does not query the launched binary capabilities"
+grep -Fq 'centaurai-core-capabilities.json' "$release_workflow" \
+  || fail "release capabilities asset is missing"
+grep -Fq '"capabilities": capabilities_response["data"]' "$release_workflow" \
+  || fail "release provenance does not embed the launched binary capabilities"
+for required_feature in \
+  decision_per_brain_knowledge_egress \
+  knowledge_dispatch_egress_gate \
+  knowledge_upload_idempotency_v2 \
+  provider_ssrf_pinned_dns; do
+  grep -Fq "\"${required_feature}\"" "$release_workflow" \
+    || fail "release binary capability gate is missing ${required_feature}"
+done
 
 while IFS= read -r action_ref; do
   [[ "$action_ref" =~ @[0-9a-f]{40}([[:space:]]|$) ]] \

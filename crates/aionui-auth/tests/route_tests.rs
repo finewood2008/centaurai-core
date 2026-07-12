@@ -731,7 +731,7 @@ async fn device_pairing_roundtrip_persists_only_hashes_and_revocation_is_immedia
         .clone()
         .oneshot(json_post_with_token(
             "/api/devices/pairing",
-            r#"{"server_url":"https://context.home.local"}"#,
+            r#"{"server_url":"https://CONTEXT.home.local:443/"}"#,
             &owner_token,
         ))
         .await
@@ -742,6 +742,12 @@ async fn device_pairing_roundtrip_persists_only_hashes_and_revocation_is_immedia
     let uri = pairing["data"]["pairing_uri"].as_str().unwrap();
     assert!(uri.starts_with("contextofme://pair?"));
     assert!(!uri.contains("device_token"));
+    let normalized_server = url::Url::parse(uri)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(name, value)| (name == "server").then(|| value.into_owned()))
+        .unwrap();
+    assert_eq!(normalized_server, "https://context.home.local");
     assert!(pairing["data"]["expires_at"].as_str().unwrap().ends_with('Z'));
     let code = pairing_code(uri);
 
@@ -909,7 +915,7 @@ async fn concurrent_device_pairing_redemption_has_one_success() {
         app.clone()
             .oneshot(json_post_with_token(
                 "/api/devices/pairing",
-                r#"{"server_url":"http://centaur-server:25808"}"#,
+                r#"{"server_url":"http://centaur-server.local:25808"}"#,
                 &token,
             ))
             .await

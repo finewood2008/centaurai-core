@@ -1,4 +1,8 @@
-use aionui_api_types::{BrainDefinition, DecisionEvidenceInput, DecisionToolDefinition, RoleDefinition};
+use aionui_api_types::{
+    BrainDefinition, DecisionEvidenceInput, DecisionToolDefinition, RetrievalBundle, RoleDefinition,
+};
+use std::any::Any;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct BrainInvocation {
@@ -66,9 +70,48 @@ pub trait BrainCatalogPort: Send + Sync {
     async fn available_brains(&self) -> Result<Vec<BrainDefinition>, BrainExecutionFailure>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrainLocation {
+    Local,
+    External,
+    Unknown,
+}
+
+/// Immutable, executor-owned snapshot of the endpoint and credentials used by
+/// one attempt. The service gates evidence against `location` from this same
+/// snapshot, eliminating a provider-update gap between classification and I/O.
+pub struct BrainExecutionPlan {
+    pub brain: BrainDefinition,
+    pub location: BrainLocation,
+    payload: Arc<dyn Any + Send + Sync>,
+}
+
+impl BrainExecutionPlan {
+    pub fn new<T>(brain: BrainDefinition, location: BrainLocation, payload: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            brain,
+            location,
+            payload: Arc::new(payload),
+        }
+    }
+
+    pub fn payload<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.payload.downcast_ref()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait BrainExecutionPort: Send + Sync {
-    async fn execute(&self, invocation: BrainInvocation) -> Result<BrainOpinion, BrainExecutionFailure>;
+    async fn prepare(&self, brain: &BrainDefinition) -> Result<BrainExecutionPlan, BrainExecutionFailure>;
+
+    async fn execute(
+        &self,
+        plan: BrainExecutionPlan,
+        invocation: BrainInvocation,
+    ) -> Result<BrainOpinion, BrainExecutionFailure>;
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +128,12 @@ pub struct DecisionKnowledgeFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DecisionKnowledgeResult {
+    pub evidence: Vec<DecisionEvidenceInput>,
+    pub retrieval: Option<RetrievalBundle>,
+}
+
 impl DecisionKnowledgeFailure {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -98,7 +147,7 @@ pub trait DecisionKnowledgePort: Send + Sync {
     async fn retrieve(
         &self,
         request: DecisionKnowledgeRequest,
-    ) -> Result<Vec<DecisionEvidenceInput>, DecisionKnowledgeFailure>;
+    ) -> Result<DecisionKnowledgeResult, DecisionKnowledgeFailure>;
 }
 
 /// Safe default until the application composes the Knowledge Gateway adapter.
@@ -110,7 +159,7 @@ impl DecisionKnowledgePort for NoopDecisionKnowledge {
     async fn retrieve(
         &self,
         _request: DecisionKnowledgeRequest,
-    ) -> Result<Vec<DecisionEvidenceInput>, DecisionKnowledgeFailure> {
-        Ok(Vec::new())
+    ) -> Result<DecisionKnowledgeResult, DecisionKnowledgeFailure> {
+        Ok(DecisionKnowledgeResult::default())
     }
 }

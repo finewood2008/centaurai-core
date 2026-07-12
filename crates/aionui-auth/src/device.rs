@@ -68,8 +68,10 @@ impl DeviceService {
         user_id: &str,
         req: CreateDevicePairingRequest,
     ) -> Result<DevicePairingSessionResponse, DeviceError> {
-        let server_url = req.server_url.trim();
-        validate_private_server_url(server_url)?;
+        let server_url = normalize_private_server_origin(
+            req.server_url.trim(),
+            cfg!(debug_assertions) || loopback_pairing_enabled(|name| std::env::var(name).ok()),
+        )?;
 
         let now = now_ms();
         let expires_at = now + PAIRING_TTL_MS;
@@ -82,7 +84,7 @@ impl DeviceService {
                 id: &pairing_id,
                 user_id,
                 code_hash: &code_hash,
-                server_url,
+                server_url: &server_url,
                 expires_at,
                 created_at: now,
             })
@@ -91,7 +93,7 @@ impl DeviceService {
         let mut pairing_uri = Url::parse("contextofme://pair").expect("static pairing URL must parse");
         pairing_uri
             .query_pairs_mut()
-            .append_pair("server", server_url)
+            .append_pair("server", &server_url)
             .append_pair("code", &code);
 
         tracing::info!(
@@ -250,7 +252,7 @@ fn validate_device_platform(value: &str) -> Result<&str, DeviceError> {
     Ok(value)
 }
 
-fn validate_private_server_url(value: &str) -> Result<(), DeviceError> {
+fn normalize_private_server_origin(value: &str, allow_loopback: bool) -> Result<String, DeviceError> {
     if value.is_empty() || value.len() > 2048 {
         return Err(DeviceError::InvalidServerUrl);
     }
@@ -258,34 +260,42 @@ fn validate_private_server_url(value: &str) -> Result<(), DeviceError> {
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
         || url.fragment().is_some()
+        || url.path() != "/"
     {
         return Err(DeviceError::InvalidServerUrl);
     }
 
     let allowed = match url.host() {
-        Some(Host::Ipv4(ip)) => allowed_ipv4(ip),
-        Some(Host::Ipv6(ip)) => allowed_ipv6(ip),
+        Some(Host::Ipv4(ip)) => allowed_ipv4(ip, allow_loopback),
+        Some(Host::Ipv6(ip)) => allowed_ipv6(ip, allow_loopback),
         Some(Host::Domain(domain)) => {
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            domain == "localhost" || domain.ends_with(".local") || domain.ends_with(".ts.net") || !domain.contains('.')
+            ((allow_loopback && domain == "localhost") || domain.ends_with(".local") || domain.ends_with(".ts.net"))
+                && (!domain.ends_with(".ts.net") || url.scheme() == "https")
         }
         None => false,
     };
-    if allowed {
-        Ok(())
-    } else {
-        Err(DeviceError::InvalidServerUrl)
+    if !allowed {
+        return Err(DeviceError::InvalidServerUrl);
     }
+    Ok(url.origin().ascii_serialization())
 }
 
-fn allowed_ipv4(ip: Ipv4Addr) -> bool {
+fn allowed_ipv4(ip: Ipv4Addr, allow_loopback: bool) -> bool {
     let octets = ip.octets();
-    ip.is_private() || ip.is_loopback() || ip.is_link_local() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+    ip.is_private() || (allow_loopback && ip.is_loopback()) || (octets[0] == 100 && (64..=127).contains(&octets[1]))
 }
 
-fn allowed_ipv6(ip: Ipv6Addr) -> bool {
-    ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+fn allowed_ipv6(ip: Ipv6Addr, allow_loopback: bool) -> bool {
+    (allow_loopback && ip.is_loopback()) || ip.is_unique_local()
+}
+
+fn loopback_pairing_enabled(mut value: impl FnMut(&str) -> Option<String>) -> bool {
+    value("CENTAURAI_CORE_ALLOW_LOOPBACK_PAIRING")
+        .or_else(|| value("AIONUI_ALLOW_LOOPBACK_PAIRING"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn timestamp_to_iso(timestamp: i64) -> Result<String, DeviceError> {
@@ -311,16 +321,33 @@ mod tests {
 
     #[test]
     fn private_server_url_policy_accepts_lan_mdns_and_tailscale() {
+        for (value, normalized) in [
+            ("http://192.168.1.5:25808", "http://192.168.1.5:25808"),
+            ("http://10.0.0.2", "http://10.0.0.2"),
+            ("http://[fd00::1]:25808", "http://[fd00::1]:25808"),
+            ("https://CONTEXT.home.local:443", "https://context.home.local"),
+            ("https://machine.tail123.ts.net", "https://machine.tail123.ts.net"),
+            ("http://100.100.100.100:25808", "http://100.100.100.100:25808"),
+        ] {
+            assert_eq!(normalize_private_server_origin(value, false).unwrap(), normalized);
+        }
+    }
+
+    #[test]
+    fn loopback_is_an_explicit_development_policy() {
         for value in [
             "http://192.168.1.5:25808",
-            "http://10.0.0.2",
-            "http://[fd00::1]:25808",
-            "https://context.home.local",
-            "https://machine.tail123.ts.net",
-            "http://100.100.100.100:25808",
-            "http://centaur-server:25808",
+            "http://127.0.0.1:25808",
+            "http://[::1]:25808",
+            "http://localhost:25808",
         ] {
-            assert!(validate_private_server_url(value).is_ok(), "{value}");
+            let expected = !value.contains("127.0.0.1") && !value.contains("::1") && !value.contains("localhost");
+            assert_eq!(
+                normalize_private_server_origin(value, false).is_ok(),
+                expected,
+                "{value}"
+            );
+            assert!(normalize_private_server_origin(value, true).is_ok(), "{value}");
         }
     }
 
@@ -333,9 +360,24 @@ mod tests {
             "javascript:alert(1)",
             "https://user:pass@context.home.local",
             "https://context.home.local/#fragment",
+            "https://context.home.local/api",
+            "https://context.home.local?token=secret",
+            "http://machine.tail123.ts.net",
+            "http://centaur-server:25808",
+            "https://printer",
+            "http://169.254.1.1",
         ] {
-            assert!(validate_private_server_url(value).is_err(), "{value}");
+            assert!(normalize_private_server_origin(value, false).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn canonical_loopback_environment_precedes_alias() {
+        assert!(!loopback_pairing_enabled(|name| match name {
+            "CENTAURAI_CORE_ALLOW_LOOPBACK_PAIRING" => Some("false".into()),
+            "AIONUI_ALLOW_LOOPBACK_PAIRING" => Some("true".into()),
+            _ => None,
+        }));
     }
 
     #[test]

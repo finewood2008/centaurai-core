@@ -55,10 +55,12 @@ async fn capabilities_are_public_and_match_the_versioned_contract() {
     assert_eq!(response.headers().get("x-content-type-options").unwrap(), "nosniff");
     let json = response_json(response.into_body()).await;
     assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["contract"]["rest"], "1");
+    assert_eq!(json["data"]["contract"]["rest"], "2");
+    assert_eq!(json["data"]["contract"]["websocket"], "2");
+    assert_eq!(json["data"]["feature_version"], "2");
     assert_eq!(json["data"]["contract"]["startup"], "2");
     assert_eq!(json["data"]["features"]["agent_management_refresh"], true);
-    assert_eq!(json["data"]["websocket"]["version"], "1");
+    assert_eq!(json["data"]["websocket"]["version"], "2");
 }
 
 #[tokio::test]

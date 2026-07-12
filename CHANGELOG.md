@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.2.2](https://github.com/finewood2008/centaurai-core/compare/v0.2.1...v0.2.2) (2026-07-12)
+
+### Features
+
+- Decisions now retain structured retrieval bundles and apply knowledge
+  evidence independently for each Brain's actual local or external execution
+  location, including fallback attempts.
+- Decision creation and knowledge-source upload accept durable, user-scoped
+  idempotency operation identifiers so a retry after a lost acknowledgement
+  returns the original resource.
+- Decision evidence preserves the complete citation locator (`page`, `chapter`,
+  start/end time and canonical URI) across persistence, REST and WebSocket
+  events.
+- Added the canonical `CENTAURAI_CORE_HTTPS` deployment variable while keeping
+  `AIONUI_HTTPS` as a transition-only alias.
+
+### Security
+
+- Provider execution resolves every DNS answer, rejects private, loopback,
+  link-local, metadata, multicast, documentation, reserved and unspecified
+  destinations for external Providers, then pins the validated addresses for
+  the connection and refuses redirects. Local Providers require a numeric
+  loopback address.
+- Device pairing now emits a normalized private origin and rejects URL paths,
+  queries, fragments, public hosts, arbitrary single-label hosts and
+  cleartext Tailscale DNS names.
+- Every Decision Brain attempt persists a knowledge-egress audit record; an
+  unapproved cloud Brain never suppresses evidence for a local Brain.
+- Ordinary conversations re-evaluate the immutable Provider destination at
+  dispatch time for every initial, replay, fallback and recovery attempt, and
+  attach personal knowledge only when that exact destination is authorized.
+- Provider preparation now freezes the validated URL, DNS addresses,
+  credential and protocol into the same execution plan that performs the
+  request, closing configuration and DNS time-of-check/time-of-use gaps.
+
+### Reliability
+
+- CI grants only the check-writing permission needed by audit reporting,
+  reclaims unused hosted-runner SDKs and disables large incremental/debug
+  artifacts to avoid disk-exhaustion failures.
+- Knowledge uploads use a boundary-independent multipart fingerprint, a
+  database-backed lease shared by Core processes and a stable Worker operation
+  key so retries can be reconciled after process failure.
+- Managed Node archives now require official per-platform SHA-256 values, and
+  bundled ACP packages install only from reviewed lockfile-v3 manifests with
+  exact versions and integrity hashes.
+- Updated `anyhow` to 1.0.103 and `git2` to 0.21.0, including the corresponding
+  fallible path API adaptation.
+
+### Compatibility and release integrity
+
+- The capabilities endpoint advertises REST, WebSocket, feature and startup
+  contract version 2 for the new Decision, knowledge-egress and idempotency
+  fields.
+- Release provenance is generated from the launched Linux x64 release binary
+  and embeds its actual `/api/capabilities` response; all workflow actions are
+  pinned to full commits.
+
 ## [0.2.1](https://github.com/finewood2008/centaurai-core/compare/v0.2.0...v0.2.1) (2026-07-12)
 
 ### Features

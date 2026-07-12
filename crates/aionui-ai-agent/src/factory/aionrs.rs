@@ -21,7 +21,7 @@ use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
-use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, ModelEgressSnapshot, classify_model_egress};
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
@@ -155,6 +155,10 @@ pub(super) async fn build(
     };
 
     let config = AionrsResolvedConfig {
+        model_egress: ModelEgressSnapshot {
+            provider_id: Some(row.id.clone()),
+            location: classify_model_egress(&row.platform, &row.base_url),
+        },
         provider,
         api_key,
         model: model_id,

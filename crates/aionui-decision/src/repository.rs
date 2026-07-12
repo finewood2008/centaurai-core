@@ -2,7 +2,7 @@ use aionui_api_types::{
     BrainDefinition, BrainKind, DecisionActionItemInput, DecisionActionItemResponse, DecisionBrainResponse,
     DecisionBrainState, DecisionCandidateResponse, DecisionEvidenceInput, DecisionEvidenceLocator,
     DecisionEvidenceResponse, DecisionResolutionResponse, DecisionResponse, DecisionSessionResponse, DecisionStatus,
-    DecisionToolDefinition, DecisionTurnResponse, RoleDefinition,
+    DecisionToolDefinition, DecisionTurnResponse, RetrievalBundle, RoleDefinition,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
@@ -59,6 +59,11 @@ struct TurnRow {
     error_code: Option<String>,
     provider_id: Option<String>,
     model: Option<String>,
+    retrieval_bundle_id: Option<String>,
+    evidence_ids_json: String,
+    lineage_bundle_ids_json: String,
+    input_cloud_egress_allowed: bool,
+    resolved_location: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -74,7 +79,13 @@ struct EvidenceRow {
     page: Option<i64>,
     chapter: Option<String>,
     timestamp_ms: Option<i64>,
+    end_seconds: Option<f64>,
+    uri: Option<String>,
     turn_id: Option<String>,
+    retrieval_bundle_id: Option<String>,
+    lineage_bundle_ids_json: String,
+    cloud_egress_allowed: bool,
+    origin_location: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -112,7 +123,32 @@ pub(crate) struct PersistedDecisionContext {
     pub brains: Vec<DecisionBrainResponse>,
     pub session_id: String,
     pub interjections: Vec<String>,
-    pub evidence: Vec<DecisionEvidenceInput>,
+    pub evidence: Vec<PersistedEvidence>,
+    pub retrieval: Option<PersistedRetrievalBundle>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedRetrievalBundle {
+    pub id: String,
+    pub bundle: RetrievalBundle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedEvidence {
+    pub id: String,
+    pub evidence: DecisionEvidenceInput,
+    pub retrieval_bundle_id: Option<String>,
+    pub lineage_bundle_ids: Vec<String>,
+    pub cloud_egress_allowed: bool,
+    pub origin_location: String,
+}
+
+pub(crate) struct EvidenceLineage<'a> {
+    pub turn_id: Option<&'a str>,
+    pub retrieval_bundle_id: Option<&'a str>,
+    pub lineage_bundle_ids: &'a [String],
+    pub cloud_egress_allowed: bool,
+    pub origin_location: &'a str,
 }
 
 pub(crate) struct NewDecision<'a> {
@@ -123,7 +159,11 @@ pub(crate) struct NewDecision<'a> {
     pub roles: &'a [RoleDefinition],
     pub tools: &'a [DecisionToolDefinition],
     pub brains: &'a [BrainDefinition],
-    pub evidence: &'a [DecisionEvidenceInput],
+    pub user_evidence: &'a [DecisionEvidenceInput],
+    pub retrieval_evidence: &'a [DecisionEvidenceInput],
+    pub retrieval: Option<&'a RetrievalBundle>,
+    pub idempotency_key: Option<&'a str>,
+    pub request_fingerprint: Option<&'a str>,
 }
 
 pub(crate) struct CompletedOpinion<'a> {
@@ -132,8 +172,27 @@ pub(crate) struct CompletedOpinion<'a> {
     pub turn_id: &'a str,
     pub content: &'a str,
     pub evidence: &'a [DecisionEvidenceInput],
+    pub retrieval_bundle_id: Option<&'a str>,
+    pub lineage_bundle_ids: &'a [String],
+    pub cloud_egress_allowed: bool,
+    pub origin_location: &'a str,
     pub rank: i64,
     pub fallback_provider_id: Option<&'a str>,
+}
+
+pub(crate) struct EgressAudit<'a> {
+    pub decision_id: &'a str,
+    pub session_id: &'a str,
+    pub brain_id: &'a str,
+    pub turn_id: &'a str,
+    pub provider_id: &'a str,
+    pub model: &'a str,
+    pub location: &'a str,
+    pub retrieval: Option<&'a PersistedRetrievalBundle>,
+    pub knowledge_egress_allowed: bool,
+    pub hit_count: usize,
+    pub evidence_ids: &'a [String],
+    pub lineage_bundle_ids: &'a [String],
 }
 
 impl DecisionRepository {
@@ -189,9 +248,76 @@ impl DecisionRepository {
             .execute(&mut *tx)
             .await?;
         }
-        insert_evidence_tx(&mut tx, &id, None, input.evidence).await?;
+        insert_evidence_tx(
+            &mut tx,
+            &id,
+            input.user_evidence,
+            EvidenceLineage {
+                turn_id: None,
+                retrieval_bundle_id: None,
+                lineage_bundle_ids: &[],
+                cloud_egress_allowed: true,
+                origin_location: "user",
+            },
+        )
+        .await?;
+        if let Some(bundle) = input.retrieval {
+            let bundle_id = insert_retrieval_bundle_tx(&mut tx, &id, bundle).await?;
+            insert_evidence_tx(
+                &mut tx,
+                &id,
+                input.retrieval_evidence,
+                EvidenceLineage {
+                    turn_id: None,
+                    retrieval_bundle_id: Some(&bundle_id),
+                    lineage_bundle_ids: std::slice::from_ref(&bundle_id),
+                    cloud_egress_allowed: bundle.cloud_authorized,
+                    origin_location: "knowledge",
+                },
+            )
+            .await?;
+        }
+        if let (Some(operation_key), Some(request_fingerprint)) = (input.idempotency_key, input.request_fingerprint) {
+            sqlx::query(
+                "INSERT INTO idempotency_records (id, user_id, operation_scope, operation_key, \
+                 request_fingerprint, resource_id, created_at) VALUES (?, ?, 'decision.create', ?, ?, ?, ?)",
+            )
+            .bind(aionui_common::generate_prefixed_id("idem"))
+            .bind(input.user_id)
+            .bind(operation_key)
+            .bind(request_fingerprint)
+            .bind(&id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         self.get(input.user_id, &id).await
+    }
+
+    pub(crate) async fn idempotent_decision(
+        &self,
+        user_id: &str,
+        operation_key: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<DecisionResponse>, DecisionError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT request_fingerprint, resource_id FROM idempotency_records \
+             WHERE user_id = ? AND operation_scope = 'decision.create' AND operation_key = ?",
+        )
+        .bind(user_id)
+        .bind(operation_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((stored_fingerprint, resource_id)) = row else {
+            return Ok(None);
+        };
+        if stored_fingerprint != request_fingerprint {
+            return Err(DecisionError::Conflict(
+                "idempotency key was already used for a different decision request".into(),
+            ));
+        }
+        self.get(user_id, &resource_id).await.map(Some)
     }
 
     pub async fn list(&self, user_id: &str) -> Result<Vec<DecisionResponse>, DecisionError> {
@@ -335,8 +461,8 @@ impl DecisionRepository {
         session_id: &str,
     ) -> Result<PersistedDecisionContext, DecisionError> {
         let decision = self.get(user_id, id).await?;
-        let stored: (String, String, String) =
-            sqlx::query_as("SELECT roles_json, tools_json, knowledge_json FROM decisions WHERE id = ? AND user_id = ?")
+        let stored: (String, String) =
+            sqlx::query_as("SELECT roles_json, tools_json FROM decisions WHERE id = ? AND user_id = ?")
                 .bind(id)
                 .bind(user_id)
                 .fetch_one(&self.pool)
@@ -347,28 +473,8 @@ impl DecisionRepository {
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
-        let cloud_use = serde_json::from_str::<serde_json::Value>(&stored.2)?
-            .get("cloud_use")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let evidence = if cloud_use {
-            decision
-                .evidence
-                .iter()
-                .map(|hit| DecisionEvidenceInput {
-                    source_id: hit.source_id.clone(),
-                    title: hit.title.clone(),
-                    snippet: hit.snippet.clone(),
-                    score: hit.score,
-                    media_type: hit.media_type.clone(),
-                    page: hit.page,
-                    chapter: hit.chapter.clone(),
-                    timestamp_ms: hit.timestamp_ms,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let evidence = self.persisted_evidence(id).await?;
+        let retrieval = self.latest_retrieval_bundle(id).await?;
         Ok(PersistedDecisionContext {
             question: decision.question,
             roles: serde_json::from_str(&stored.0)?,
@@ -377,7 +483,101 @@ impl DecisionRepository {
             session_id: session_id.to_owned(),
             interjections,
             evidence,
+            retrieval,
         })
+    }
+
+    pub(crate) async fn store_retrieval_evidence(
+        &self,
+        user_id: &str,
+        decision_id: &str,
+        bundle: &RetrievalBundle,
+        evidence: &[DecisionEvidenceInput],
+    ) -> Result<String, DecisionError> {
+        // Ownership check prevents a caller from attaching a bundle to
+        // another user's decision even if an id is guessed.
+        self.get(user_id, decision_id).await?;
+        let mut tx = self.pool.begin().await?;
+        let id = insert_retrieval_bundle_tx(&mut tx, decision_id, bundle).await?;
+        insert_evidence_tx(
+            &mut tx,
+            decision_id,
+            evidence,
+            EvidenceLineage {
+                turn_id: None,
+                retrieval_bundle_id: Some(&id),
+                lineage_bundle_ids: std::slice::from_ref(&id),
+                cloud_egress_allowed: bundle.cloud_authorized,
+                origin_location: "knowledge",
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn latest_retrieval_bundle(
+        &self,
+        decision_id: &str,
+    ) -> Result<Option<PersistedRetrievalBundle>, DecisionError> {
+        let row: Option<(String, String, String, i64, bool, String)> = sqlx::query_as(
+            "SELECT id, query, hits_json, token_budget, cloud_authorized, space_ids_json \
+             FROM decision_retrieval_bundles WHERE decision_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(decision_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(
+            |(id, query, hits_json, token_budget, cloud_authorized, space_ids_json)| {
+                let token_budget = u32::try_from(token_budget)
+                    .map_err(|_| DecisionError::Internal("invalid persisted retrieval token budget".into()))?;
+                Ok(PersistedRetrievalBundle {
+                    id,
+                    bundle: RetrievalBundle {
+                        query,
+                        hits: serde_json::from_str(&hits_json)?,
+                        token_budget,
+                        cloud_authorized,
+                        space_ids: serde_json::from_str(&space_ids_json)?,
+                    },
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub(crate) async fn record_egress(&self, audit: EgressAudit<'_>) -> Result<(), DecisionError> {
+        let (retrieval_bundle_id, space_ids_json) = match audit.retrieval {
+            Some(retrieval) => (
+                Some(retrieval.id.as_str()),
+                serde_json::to_string(&retrieval.bundle.space_ids)?,
+            ),
+            None => (None, "[]".to_owned()),
+        };
+        sqlx::query(
+            "INSERT INTO decision_egress_audit (id, decision_id, session_id, brain_id, turn_id, provider_id, \
+             model, location, retrieval_bundle_id, knowledge_egress_allowed, hit_count, evidence_ids_json, \
+             lineage_bundle_ids_json, space_ids_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(aionui_common::generate_prefixed_id("egress"))
+        .bind(audit.decision_id)
+        .bind(audit.session_id)
+        .bind(audit.brain_id)
+        .bind(audit.turn_id)
+        .bind(audit.provider_id)
+        .bind(audit.model)
+        .bind(audit.location)
+        .bind(retrieval_bundle_id)
+        .bind(audit.knowledge_egress_allowed)
+        .bind(i64::try_from(audit.hit_count).unwrap_or(i64::MAX))
+        .bind(serde_json::to_string(audit.evidence_ids)?)
+        .bind(serde_json::to_string(audit.lineage_bundle_ids)?)
+        .bind(space_ids_json)
+        .bind(aionui_common::now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn mark_brain_running(&self, brain_id: &str) -> Result<(), DecisionError> {
@@ -389,6 +589,7 @@ impl DecisionRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_turn_attempt(
         &self,
         decision_id: &str,
@@ -397,12 +598,19 @@ impl DecisionRepository {
         attempt: i64,
         provider_id: &str,
         model: &str,
+        retrieval_bundle_id: Option<&str>,
+        evidence_ids: &[String],
+        lineage_bundle_ids: &[String],
+        input_cloud_egress_allowed: bool,
+        resolved_location: &str,
     ) -> Result<String, DecisionError> {
         let id = aionui_common::generate_prefixed_id("decision_turn");
         let now = aionui_common::now_ms();
         sqlx::query(
             "INSERT INTO decision_turns (id, decision_id, session_id, brain_id, kind, status, attempt, provider_id, \
-             model, created_at, updated_at) VALUES (?, ?, ?, ?, 'opinion', 'running', ?, ?, ?, ?, ?)",
+             model, retrieval_bundle_id, evidence_ids_json, lineage_bundle_ids_json, input_cloud_egress_allowed, \
+             resolved_location, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'opinion', 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(decision_id)
@@ -411,6 +619,11 @@ impl DecisionRepository {
         .bind(attempt)
         .bind(provider_id)
         .bind(model)
+        .bind(retrieval_bundle_id)
+        .bind(serde_json::to_string(evidence_ids)?)
+        .bind(serde_json::to_string(lineage_bundle_ids)?)
+        .bind(input_cloud_egress_allowed)
+        .bind(resolved_location)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -425,6 +638,32 @@ impl DecisionRepository {
             .bind(turn_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn set_turn_execution_context(
+        &self,
+        turn_id: &str,
+        retrieval_bundle_id: Option<&str>,
+        evidence_ids: &[String],
+        lineage_bundle_ids: &[String],
+        input_cloud_egress_allowed: bool,
+        resolved_location: &str,
+    ) -> Result<(), DecisionError> {
+        sqlx::query(
+            "UPDATE decision_turns SET retrieval_bundle_id = ?, evidence_ids_json = ?, \
+             lineage_bundle_ids_json = ?, input_cloud_egress_allowed = ?, resolved_location = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(retrieval_bundle_id)
+        .bind(serde_json::to_string(evidence_ids)?)
+        .bind(serde_json::to_string(lineage_bundle_ids)?)
+        .bind(input_cloud_egress_allowed)
+        .bind(resolved_location)
+        .bind(aionui_common::now_ms())
+        .bind(turn_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -460,7 +699,19 @@ impl DecisionRepository {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        insert_evidence_tx(&mut tx, opinion.decision_id, Some(opinion.turn_id), opinion.evidence).await?;
+        insert_evidence_tx(
+            &mut tx,
+            opinion.decision_id,
+            opinion.evidence,
+            EvidenceLineage {
+                turn_id: Some(opinion.turn_id),
+                retrieval_bundle_id: opinion.retrieval_bundle_id,
+                lineage_bundle_ids: opinion.lineage_bundle_ids,
+                cloud_egress_allowed: opinion.cloud_egress_allowed,
+                origin_location: opinion.origin_location,
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -646,7 +897,19 @@ impl DecisionRepository {
     ) -> Result<Vec<DecisionEvidenceResponse>, DecisionError> {
         self.get(user_id, id).await?;
         let mut tx = self.pool.begin().await?;
-        insert_evidence_tx(&mut tx, id, None, evidence).await?;
+        insert_evidence_tx(
+            &mut tx,
+            id,
+            evidence,
+            EvidenceLineage {
+                turn_id: None,
+                retrieval_bundle_id: None,
+                lineage_bundle_ids: &[],
+                cloud_egress_allowed: true,
+                origin_location: "user",
+            },
+        )
+        .await?;
         tx.commit().await?;
         self.evidence(id).await
     }
@@ -793,7 +1056,9 @@ impl DecisionRepository {
     async fn turns(&self, id: &str) -> Result<Vec<DecisionTurnResponse>, DecisionError> {
         let rows = sqlx::query_as::<_, TurnRow>(
             "SELECT id, session_id, brain_id, kind, content, status, attempt, error_code, provider_id, model, \
-             created_at, updated_at FROM decision_turns WHERE decision_id = ? ORDER BY created_at, id",
+             retrieval_bundle_id, evidence_ids_json, lineage_bundle_ids_json, input_cloud_egress_allowed, \
+             resolved_location, created_at, updated_at \
+             FROM decision_turns WHERE decision_id = ? ORDER BY created_at, id",
         )
         .bind(id)
         .fetch_all(&self.pool)
@@ -811,6 +1076,11 @@ impl DecisionRepository {
                 error_code: row.error_code,
                 provider_id: row.provider_id,
                 model: row.model,
+                retrieval_bundle_id: row.retrieval_bundle_id,
+                evidence_ids: serde_json::from_str(&row.evidence_ids_json).unwrap_or_default(),
+                lineage_bundle_ids: serde_json::from_str(&row.lineage_bundle_ids_json).unwrap_or_default(),
+                input_cloud_egress_allowed: row.input_cloud_egress_allowed,
+                resolved_location: row.resolved_location,
                 created_at: timestamp(row.created_at),
                 updated_at: timestamp(row.updated_at),
             })
@@ -819,7 +1089,8 @@ impl DecisionRepository {
 
     async fn evidence(&self, id: &str) -> Result<Vec<DecisionEvidenceResponse>, DecisionError> {
         let rows = sqlx::query_as::<_, EvidenceRow>(
-            "SELECT id, source_id, title, snippet, score, media_type, page, chapter, timestamp_ms, turn_id \
+            "SELECT id, source_id, title, snippet, score, media_type, page, chapter, timestamp_ms, end_seconds, uri, turn_id, \
+             retrieval_bundle_id, lineage_bundle_ids_json, cloud_egress_allowed, origin_location \
              FROM decision_evidence WHERE decision_id = ? ORDER BY created_at, id",
         )
         .bind(id)
@@ -838,13 +1109,53 @@ impl DecisionRepository {
                 chapter: row.chapter.clone(),
                 timestamp_ms: row.timestamp_ms,
                 turn_id: row.turn_id,
+                retrieval_bundle_id: row.retrieval_bundle_id,
+                lineage_bundle_ids: serde_json::from_str(&row.lineage_bundle_ids_json).unwrap_or_default(),
+                cloud_egress_allowed: row.cloud_egress_allowed,
+                origin_location: row.origin_location,
                 locator: DecisionEvidenceLocator {
                     page: row.page,
                     chapter: row.chapter,
                     start_seconds: row.timestamp_ms.map(|value| value as f64 / 1_000.0),
+                    end_seconds: row.end_seconds,
+                    uri: row.uri,
                 },
             })
             .collect())
+    }
+
+    async fn persisted_evidence(&self, id: &str) -> Result<Vec<PersistedEvidence>, DecisionError> {
+        let rows = sqlx::query_as::<_, EvidenceRow>(
+            "SELECT id, source_id, title, snippet, score, media_type, page, chapter, timestamp_ms, end_seconds, uri, turn_id, \
+             retrieval_bundle_id, lineage_bundle_ids_json, cloud_egress_allowed, origin_location \
+             FROM decision_evidence WHERE decision_id = ? ORDER BY created_at, id",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PersistedEvidence {
+                    id: row.id,
+                    evidence: DecisionEvidenceInput {
+                        source_id: row.source_id,
+                        title: row.title,
+                        snippet: row.snippet,
+                        score: row.score,
+                        media_type: row.media_type,
+                        page: row.page,
+                        chapter: row.chapter,
+                        timestamp_ms: row.timestamp_ms,
+                        end_seconds: row.end_seconds,
+                        uri: row.uri,
+                    },
+                    retrieval_bundle_id: row.retrieval_bundle_id,
+                    lineage_bundle_ids: serde_json::from_str(&row.lineage_bundle_ids_json)?,
+                    cloud_egress_allowed: row.cloud_egress_allowed,
+                    origin_location: row.origin_location,
+                })
+            })
+            .collect()
     }
 
     async fn candidates(&self, id: &str) -> Result<Vec<DecisionCandidateResponse>, DecisionError> {
@@ -904,26 +1215,55 @@ impl DecisionRepository {
     }
 }
 
+async fn insert_retrieval_bundle_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    decision_id: &str,
+    bundle: &RetrievalBundle,
+) -> Result<String, DecisionError> {
+    let id = aionui_common::generate_prefixed_id("retrieval");
+    sqlx::query(
+        "INSERT INTO decision_retrieval_bundles (id, decision_id, query, hits_json, token_budget, \
+         cloud_authorized, space_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(decision_id)
+    .bind(&bundle.query)
+    .bind(serde_json::to_string(&bundle.hits)?)
+    .bind(i64::from(bundle.token_budget))
+    .bind(bundle.cloud_authorized)
+    .bind(serde_json::to_string(&bundle.space_ids)?)
+    .bind(aionui_common::now_ms())
+    .execute(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
 async fn insert_evidence_tx(
     tx: &mut Transaction<'_, Sqlite>,
     decision_id: &str,
-    turn_id: Option<&str>,
     evidence: &[DecisionEvidenceInput],
+    lineage: EvidenceLineage<'_>,
 ) -> Result<(), DecisionError> {
     let now = aionui_common::now_ms();
+    let lineage_bundle_ids_json = serde_json::to_string(lineage.lineage_bundle_ids)?;
     for hit in evidence {
         sqlx::query(
             "INSERT INTO decision_evidence (id, decision_id, turn_id, source_id, title, snippet, score, media_type, \
-             page, chapter, timestamp_ms, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             page, chapter, timestamp_ms, end_seconds, uri, created_at, retrieval_bundle_id, lineage_bundle_ids_json, \
+             cloud_egress_allowed, origin_location) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE NOT EXISTS (SELECT 1 FROM decision_evidence WHERE decision_id = ? AND source_id = ? \
              AND snippet = ? AND COALESCE(page, -1) = COALESCE(?, -1) \
              AND COALESCE(chapter, '') = COALESCE(?, '') \
-             AND COALESCE(timestamp_ms, -1) = COALESCE(?, -1))",
+             AND COALESCE(timestamp_ms, -1) = COALESCE(?, -1) \
+             AND COALESCE(end_seconds, -1.0) = COALESCE(?, -1.0) \
+             AND COALESCE(uri, '') = COALESCE(?, '') \
+             AND COALESCE(retrieval_bundle_id, '') = COALESCE(?, '') \
+             AND COALESCE(turn_id, '') = COALESCE(?, ''))",
         )
         .bind(aionui_common::generate_prefixed_id("evidence"))
         .bind(decision_id)
-        .bind(turn_id)
+        .bind(lineage.turn_id)
         .bind(&hit.source_id)
         .bind(&hit.title)
         .bind(&hit.snippet)
@@ -932,13 +1272,23 @@ async fn insert_evidence_tx(
         .bind(hit.page)
         .bind(&hit.chapter)
         .bind(hit.timestamp_ms)
+        .bind(hit.end_seconds)
+        .bind(&hit.uri)
         .bind(now)
+        .bind(lineage.retrieval_bundle_id)
+        .bind(&lineage_bundle_ids_json)
+        .bind(lineage.cloud_egress_allowed)
+        .bind(lineage.origin_location)
         .bind(decision_id)
         .bind(&hit.source_id)
         .bind(&hit.snippet)
         .bind(hit.page)
         .bind(&hit.chapter)
         .bind(hit.timestamp_ms)
+        .bind(hit.end_seconds)
+        .bind(&hit.uri)
+        .bind(lineage.retrieval_bundle_id)
+        .bind(lineage.turn_id)
         .execute(&mut **tx)
         .await?;
     }
@@ -1041,13 +1391,29 @@ mod tests {
                 roles: &roles,
                 tools: &[],
                 brains: &brains,
-                evidence: &[],
+                user_evidence: &[],
+                retrieval_evidence: &[],
+                retrieval: None,
+                idempotency_key: None,
+                request_fingerprint: None,
             })
             .await
             .unwrap();
         let session = repo.begin_session("system_default_user", &created.id).await.unwrap();
         let turn = repo
-            .insert_turn_attempt(&created.id, &session, "brain-1", 1, "provider-1", "model-1")
+            .insert_turn_attempt(
+                &created.id,
+                &session,
+                "brain-1",
+                1,
+                "provider-1",
+                "model-1",
+                None,
+                &[],
+                &[],
+                true,
+                "external",
+            )
             .await
             .unwrap();
         let loaded = repo.get("system_default_user", &created.id).await.unwrap();
@@ -1057,6 +1423,10 @@ mod tests {
             turn_id: &turn,
             content: "Ship behind a flag",
             evidence: &[],
+            retrieval_bundle_id: None,
+            lineage_bundle_ids: &[],
+            cloud_egress_allowed: true,
+            origin_location: "external",
             rank: 0,
             fallback_provider_id: None,
         })

@@ -10,7 +10,8 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{
-    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION,
+    ModelEgressLocation, ModelEgressSnapshot, SendMessageData,
 };
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
@@ -34,11 +35,12 @@ use aionui_db::models::{
     MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
+    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, CreateAgentRunParams, DbError,
+    IAcpSessionRepository, IAgentMetadataRepository, IAgentRunRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate,
+    MessageSearchRow, PersistedSessionState, SaveRuntimeStateParams, SqliteAgentRunRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
+    SqliteConversationRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
     init_database_memory,
 };
@@ -48,6 +50,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
+use crate::run_scheduler::AgentRunScheduler;
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
@@ -3212,6 +3215,7 @@ struct ScriptedAgent {
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
     send_error: Option<AgentSendError>,
+    model_egress: ModelEgressSnapshot,
 }
 
 impl ScriptedAgent {
@@ -3225,6 +3229,7 @@ impl ScriptedAgent {
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
             send_error: None,
+            model_egress: ModelEgressSnapshot::default(),
         }
     }
 
@@ -3240,6 +3245,14 @@ impl ScriptedAgent {
 
     fn with_send_error(mut self, error: AgentSendError) -> Self {
         self.send_error = Some(error);
+        self
+    }
+
+    fn with_model_egress(mut self, location: ModelEgressLocation) -> Self {
+        self.model_egress = ModelEgressSnapshot {
+            provider_id: Some(format!("test-{location:?}")),
+            location,
+        };
         self
     }
 
@@ -3300,7 +3313,11 @@ impl IAgentTask for ScriptedAgent {
     }
 }
 
-impl IMockAgent for ScriptedAgent {}
+impl IMockAgent for ScriptedAgent {
+    fn model_egress_snapshot(&self) -> ModelEgressSnapshot {
+        self.model_egress.clone()
+    }
+}
 
 // ── send_message tests ──────────────────────────────────────────
 
@@ -3309,6 +3326,38 @@ fn make_send_req() -> SendMessageRequest {
         "content": "Hello"
     }))
     .unwrap()
+}
+
+fn make_knowledge_send_req(
+    mode: aionui_api_types::SendMessageKnowledgeMode,
+    cloud_authorized: bool,
+) -> SendMessageRequest {
+    SendMessageRequest {
+        content: "Hello".into(),
+        files: vec![],
+        inject_skills: vec![],
+        hidden: false,
+        knowledge: Some(aionui_api_types::SendMessageKnowledge {
+            mode,
+            space_ids: vec!["personal".into()],
+            max_hits: 8,
+            cloud_use: cloud_authorized,
+        }),
+        retrieval: Some(aionui_api_types::RetrievalBundle {
+            query: "Hello".into(),
+            hits: vec![aionui_api_types::KnowledgeHit {
+                source_id: "source_1".into(),
+                title: "Plan".into(),
+                snippet: "Private beta starts Monday.".into(),
+                score: 0.9,
+                media_type: "pdf".into(),
+                locator: Default::default(),
+            }],
+            token_budget: 16,
+            cloud_authorized,
+            space_ids: vec!["personal".into()],
+        }),
+    }
 }
 
 fn assert_conversation_runtime_context(options: &BuildTaskOptions, user_id: &str, conversation_id: &str) {
@@ -3366,10 +3415,13 @@ async fn send_message_returns_accepted() {
 async fn send_message_injects_server_retrieval_only_at_model_dispatch() {
     let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    let agent = Arc::new(ScriptedAgent::new(
-        &conv.id,
-        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
-    ));
+    let agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_model_egress(ModelEgressLocation::Local),
+    );
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
         agent.clone(),
     )]));
@@ -3412,6 +3464,209 @@ async fn send_message_injects_server_retrieval_only_at_model_dispatch() {
     assert_eq!(content["content"], "Hello");
     assert_eq!(content["retrieval"]["hits"][0]["source_id"], "source_1");
     assert!(!user.content.contains("LOCAL_KNOWLEDGE_EVIDENCE_JSON_START"));
+}
+
+#[tokio::test]
+async fn provider_update_to_external_is_rechecked_after_local_retrieval_preflight() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let external = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_model_egress(ModelEgressLocation::External),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        external.clone(),
+    )]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+    svc.send_message(
+        "user_1",
+        &conv.id,
+        make_knowledge_send_req(aionui_api_types::SendMessageKnowledgeMode::Auto, false),
+        &task_mgr_dyn,
+    )
+    .await
+    .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(external.sent_contents(), vec!["Hello"]);
+}
+
+#[tokio::test]
+async fn recovery_fallback_rechecks_local_to_external_knowledge_egress() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let local = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary local provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            })]],
+        )
+        .with_model_egress(ModelEgressLocation::Local),
+    );
+    let external = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_model_egress(ModelEgressLocation::External),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(local.clone()),
+        AgentInstance::Mock(external.clone()),
+    ]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message(
+        "user_1",
+        &conv.id,
+        make_knowledge_send_req(aionui_api_types::SendMessageKnowledgeMode::Auto, false),
+        &task_mgr_dyn,
+    )
+    .await
+    .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert!(local.sent_contents()[0].contains("LOCAL_KNOWLEDGE_EVIDENCE_JSON_START"));
+    assert_eq!(external.sent_contents(), vec!["Hello"]);
+}
+
+#[tokio::test]
+async fn required_knowledge_fails_before_unauthorized_external_dispatch() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let external = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_model_egress(ModelEgressLocation::External),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        external.clone(),
+    )]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+    svc.send_message(
+        "user_1",
+        &conv.id,
+        make_knowledge_send_req(aionui_api_types::SendMessageKnowledgeMode::Required, false),
+        &task_mgr_dyn,
+    )
+    .await
+    .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert!(external.sent_contents().is_empty());
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tip = messages.iter().find(|message| message.r#type == "tips").unwrap();
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+    assert_eq!(content["code"], "KNOWLEDGE_CLOUD_CONSENT_REQUIRED");
+}
+
+#[tokio::test]
+async fn explicitly_authorized_external_attempt_receives_knowledge() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let external = Arc::new(
+        ScriptedAgent::new(
+            &conv.id,
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_model_egress(ModelEgressLocation::External),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        external.clone(),
+    )]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+    svc.send_message(
+        "user_1",
+        &conv.id,
+        make_knowledge_send_req(aionui_api_types::SendMessageKnowledgeMode::Auto, true),
+        &task_mgr_dyn,
+    )
+    .await
+    .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert!(external.sent_contents()[0].contains("LOCAL_KNOWLEDGE_EVIDENCE_JSON_START"));
+}
+
+#[tokio::test]
+async fn queued_restart_recovery_rechecks_persisted_knowledge_against_final_provider() {
+    let database = init_database_memory().await.unwrap();
+    let now = aionui_common::now_ms();
+
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let conversation_repo = Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+    let external = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_model_egress(ModelEgressLocation::External),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        external.clone(),
+    )]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    let run_repo = Arc::new(SqliteAgentRunRepository::new(database.pool().clone()));
+    let scheduler = AgentRunScheduler::new(run_repo.clone(), broadcaster.clone());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        conversation_repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    )
+    .with_run_scheduler(scheduler);
+    let conversation = service.create("system_default_user", make_create_req()).await.unwrap();
+
+    let request_json = serde_json::to_string(&make_knowledge_send_req(
+        aionui_api_types::SendMessageKnowledgeMode::Auto,
+        false,
+    ))
+    .unwrap();
+    run_repo
+        .create_queued(&CreateAgentRunParams {
+            id: "run-recovered-egress",
+            turn_id: "turn_recovered_egress",
+            user_id: "system_default_user",
+            conversation_id: &conversation.id,
+            source: "conversation",
+            request_json: &request_json,
+            message_id: None,
+            queued_at: now,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(service.recover_queued_agent_runs().await.unwrap(), 1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while external.sent_contents().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered run should reach the model dispatch boundary");
+    wait_for_turn_released(&service, &conversation.id).await;
+
+    assert_eq!(external.sent_contents(), vec!["Hello"]);
 }
 
 #[tokio::test]

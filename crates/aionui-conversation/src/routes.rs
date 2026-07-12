@@ -318,6 +318,7 @@ async fn send_msg(
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(mut req) = body.map_err(ApiError::from)?;
+    discard_client_retrieval(&mut req);
     if req.knowledge.is_some() {
         // Authorize the conversation before doing potentially expensive
         // retrieval, and before exposing whether any knowledge exists.
@@ -334,6 +335,12 @@ async fn send_msg(
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+}
+
+fn discard_client_retrieval(request: &mut SendMessageRequest) {
+    // `retrieval` is a Core-owned field persisted for restart recovery. Never
+    // trust a public client to forge hits or the cloud-authorization bit.
+    request.retrieval = None;
 }
 
 async fn list_artifacts(
@@ -497,6 +504,33 @@ async fn active_count(
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn public_message_cannot_forge_retrieval_or_cloud_consent() {
+        let mut request: SendMessageRequest = serde_json::from_value(serde_json::json!({
+            "content": "hello",
+            "retrieval": {
+                "query": "hello",
+                "hits": [],
+                "token_budget": 0,
+                "cloud_authorized": true,
+                "space_ids": ["personal"]
+            }
+        }))
+        .unwrap();
+        assert!(request.retrieval.is_none(), "DTO must ignore public retrieval input");
+        request.retrieval = Some(aionui_api_types::RetrievalBundle {
+            query: "server-restored".into(),
+            hits: vec![],
+            token_budget: 0,
+            cloud_authorized: true,
+            space_ids: vec!["personal".into()],
+        });
+
+        discard_client_retrieval(&mut request);
+
+        assert!(request.retrieval.is_none());
+    }
 
     #[test]
     fn conversation_not_found_maps_to_app_not_found() {

@@ -50,6 +50,8 @@ pub struct DecisionToolDefinition {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateDecisionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_operation_id: Option<String>,
     pub question: String,
     #[serde(default = "default_brain_count")]
     pub brain_count: usize,
@@ -113,6 +115,10 @@ pub struct DecisionEvidenceInput {
     pub chapter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +180,14 @@ pub struct DecisionTurnResponse {
     pub error_code: Option<String>,
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_bundle_id: Option<String>,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub lineage_bundle_ids: Vec<String>,
+    pub input_cloud_egress_allowed: bool,
+    pub resolved_location: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -186,6 +200,10 @@ pub struct DecisionEvidenceLocator {
     pub chapter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -200,6 +218,12 @@ pub struct DecisionEvidenceResponse {
     pub chapter: Option<String>,
     pub timestamp_ms: Option<i64>,
     pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_bundle_id: Option<String>,
+    #[serde(default)]
+    pub lineage_bundle_ids: Vec<String>,
+    pub cloud_egress_allowed: bool,
+    pub origin_location: String,
     pub locator: DecisionEvidenceLocator,
 }
 

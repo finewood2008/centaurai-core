@@ -1,5 +1,6 @@
 mod types;
 
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::error::Error as StdError;
 use std::fs::{self};
@@ -34,7 +35,9 @@ struct PlatformSpec {
 #[derive(Debug, Serialize)]
 struct DevPackageJson<'a> {
     name: &'a str,
+    version: &'a str,
     private: bool,
+    dependencies: BTreeMap<&'a str, &'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,28 +494,7 @@ async fn prepare_local_tool_source_to_root(
     fs::create_dir_all(&project_dir).map_err(ManagedAcpToolError::io)?;
     fs::create_dir_all(&npm_cache_dir).map_err(ManagedAcpToolError::io)?;
 
-    write_dev_package_json(&project_dir)?;
-    run_npm_prepare_step(
-        node_runtime,
-        &project_dir,
-        &npm_cache_dir,
-        [
-            "install",
-            "--package-lock-only",
-            "--ignore-scripts",
-            "--include=optional",
-            "--fund=false",
-            "--audit=false",
-            "--save-exact",
-            "--os",
-            spec.npm_os,
-            "--cpu",
-            spec.npm_cpu,
-            &format!("{}@{}", tool.package_name(), tool.version()),
-        ],
-        "generate managed ACP local lockfile",
-    )
-    .await?;
+    write_locked_package_files(&project_dir, tool)?;
     run_npm_prepare_step(
         node_runtime,
         &project_dir,
@@ -593,17 +575,29 @@ async fn run_npm_prepare_step<const N: usize>(
     )))
 }
 
-fn write_dev_package_json(project_dir: &Path) -> Result<(), ManagedAcpToolError> {
+fn write_locked_package_files(project_dir: &Path, tool: ManagedAcpToolId) -> Result<(), ManagedAcpToolError> {
     let package_json = DevPackageJson {
-        name: "aionui-managed-acp-dev",
+        name: "centaurai-managed-acp",
+        version: "1.0.0",
         private: true,
+        dependencies: BTreeMap::from([(tool.package_name(), tool.version())]),
     };
     fs::write(
         project_dir.join("package.json"),
         serde_json::to_vec_pretty(&package_json)
             .map_err(|error| ManagedAcpToolError::invalid(format!("serialize local package.json: {error}")))?,
     )
-    .map_err(ManagedAcpToolError::io)
+    .map_err(ManagedAcpToolError::io)?;
+    fs::write(project_dir.join("package-lock.json"), reviewed_package_lock(tool)).map_err(ManagedAcpToolError::io)
+}
+
+fn reviewed_package_lock(tool: ManagedAcpToolId) -> &'static str {
+    match tool {
+        ManagedAcpToolId::CodexAcp => include_str!("../../assets/acp-locks/codex-acp.package-lock.json"),
+        ManagedAcpToolId::ClaudeAgentAcp => {
+            include_str!("../../assets/acp-locks/claude-agent-acp.package-lock.json")
+        }
+    }
 }
 
 fn build_local_artifact_manifest(
@@ -1007,6 +1001,39 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fmt;
+
+    #[test]
+    fn reviewed_acp_locks_are_v3_exact_and_integrity_complete() {
+        for tool in [ManagedAcpToolId::CodexAcp, ManagedAcpToolId::ClaudeAgentAcp] {
+            let lock: serde_json::Value = serde_json::from_str(reviewed_package_lock(tool)).unwrap();
+            assert_eq!(lock["lockfileVersion"], 3);
+            assert_eq!(
+                lock["packages"][""]["dependencies"][tool.package_name()],
+                tool.version()
+            );
+            let packages = lock["packages"].as_object().unwrap();
+            for (path, package) in packages.iter().filter(|(path, _)| !path.is_empty()) {
+                assert!(
+                    package["resolved"]
+                        .as_str()
+                        .is_some_and(|value| value.starts_with("https://registry.npmjs.org/")),
+                    "{path} has no pinned npm registry URL"
+                );
+                assert!(
+                    package["integrity"]
+                        .as_str()
+                        .is_some_and(|value| value.starts_with("sha512-")),
+                    "{path} has no sha512 integrity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn managed_acp_preparation_never_resolves_a_new_lockfile_online() {
+        let forbidden = ["--package", "-lock-only"].concat();
+        assert!(!include_str!("mod.rs").contains(&forbidden));
+    }
 
     #[test]
     fn managed_acp_tool_command_uses_node_runtime() {

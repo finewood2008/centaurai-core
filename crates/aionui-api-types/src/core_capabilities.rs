@@ -34,23 +34,24 @@ mod tests {
     fn serializes_the_client_negotiation_shape() {
         let value = serde_json::to_value(CoreCapabilitiesResponse {
             contract: CoreContractVersions {
-                rest: "1".into(),
-                websocket: "1".into(),
+                rest: "2".into(),
+                websocket: "2".into(),
                 startup: "2".into(),
             },
-            feature_version: "1".into(),
+            feature_version: "2".into(),
             features: BTreeMap::from([("agent_management_refresh".into(), true)]),
             websocket: CoreWebSocketCapabilities {
-                version: "1".into(),
+                version: "2".into(),
                 events: vec!["team.agentStatusChanged".into()],
             },
         })
         .unwrap();
 
-        assert_eq!(value["contract"]["rest"], "1");
-        assert_eq!(value["feature_version"], "1");
+        assert_eq!(value["contract"]["rest"], "2");
+        assert_eq!(value["contract"]["websocket"], "2");
+        assert_eq!(value["feature_version"], "2");
         assert_eq!(value["features"]["agent_management_refresh"], true);
-        assert_eq!(value["websocket"]["version"], "1");
+        assert_eq!(value["websocket"]["version"], "2");
         assert_eq!(value["websocket"]["events"][0], "team.agentStatusChanged");
     }
 }

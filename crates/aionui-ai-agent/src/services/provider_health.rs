@@ -17,7 +17,7 @@ use regex::Regex;
 use tracing::{info, warn};
 
 use crate::factory::aionrs::{map_aionrs_provider, resolve_aionrs_url_and_compat, resolve_bedrock_config};
-use crate::types::AionrsResolvedConfig;
+use crate::types::{AionrsResolvedConfig, ModelEgressSnapshot, classify_model_egress};
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_CHECK_MAX_TOKENS: u32 = 16;
@@ -76,6 +76,10 @@ impl ProviderHealthCheckService {
         };
 
         Ok(AionrsResolvedConfig {
+            model_egress: ModelEgressSnapshot {
+                provider_id: Some(row.id.clone()),
+                location: classify_model_egress(&row.platform, &row.base_url),
+            },
             provider,
             api_key,
             model: model_id.to_owned(),
