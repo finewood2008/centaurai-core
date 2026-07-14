@@ -282,6 +282,109 @@ async fn management_rows_mark_installed_agents_without_health_check_unchecked() 
 }
 
 #[tokio::test]
+async fn management_rows_sort_installed_agents_before_missing_agents() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+    for (id, name, command, sort_order) in [
+        (
+            "agent-missing-first",
+            "Missing First",
+            "definitely-missing-agent-binary",
+            1,
+        ),
+        ("agent-installed-last", "Installed Last", "cargo", 9_999),
+    ] {
+        let source_info = serde_json::json!({ "binary_name": command }).to_string();
+        repo.upsert(&UpsertAgentMetadataParams {
+            id,
+            icon: None,
+            name,
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("custom"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(&source_info),
+            enabled: true,
+            command: Some(command),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order,
+        })
+        .await
+        .unwrap();
+    }
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    let rows = registry.list_management_rows().await;
+    let installed_index = rows.iter().position(|row| row.id == "agent-installed-last").unwrap();
+    let missing_index = rows.iter().position(|row| row.id == "agent-missing-first").unwrap();
+
+    assert!(rows[installed_index].installed);
+    assert_eq!(rows[missing_index].status, AgentManagementStatus::Missing);
+    assert!(installed_index < missing_index);
+}
+
+#[tokio::test]
+async fn management_rows_keep_disabled_installed_agent_marked_installed() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let source_info = serde_json::json!({ "binary_name": "cargo" }).to_string();
+    repo.upsert(&UpsertAgentMetadataParams {
+        id: "agent-disabled-installed",
+        icon: None,
+        name: "Disabled Installed",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("custom"),
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: Some(&source_info),
+        enabled: false,
+        command: Some("cargo"),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 10,
+    })
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|row| row.id == "agent-disabled-installed")
+        .unwrap();
+
+    assert!(!row.enabled);
+    assert!(row.installed);
+}
+
+#[tokio::test]
 async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8() {
     let db = init_database_memory().await.unwrap();
     sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
@@ -337,7 +440,7 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
         description_i18n: None,
         backend: Some("claude"),
         agent_type: "acp",
-        agent_source: "builtin",
+        agent_source: "custom",
         agent_source_info: None,
         enabled: true,
         command: None,

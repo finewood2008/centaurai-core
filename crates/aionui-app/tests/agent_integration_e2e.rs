@@ -311,7 +311,12 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
     json["data"]["id"].as_str().unwrap().to_owned()
 }
 
-async fn upsert_visible_agent_metadata(services: &aionui_app::AppServices, id: &str, agent_type: &str) {
+async fn upsert_visible_agent_metadata(
+    services: &aionui_app::AppServices,
+    id: &str,
+    agent_type: &str,
+    agent_source: &str,
+) {
     services
         .agent_registry
         .repo_handle()
@@ -324,7 +329,7 @@ async fn upsert_visible_agent_metadata(services: &aionui_app::AppServices, id: &
             description_i18n: None,
             backend: Some(id),
             agent_type,
-            agent_source: "internal",
+            agent_source,
             agent_source_info: Some("{}"),
             enabled: true,
             command: None,
@@ -348,22 +353,12 @@ async fn upsert_visible_agent_metadata(services: &aionui_app::AppServices, id: &
 // ── Agent catalog tests ─────────────────────────────────────────
 
 #[tokio::test]
-async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
+async fn management_endpoint_hides_retired_builtins_but_keeps_historical_metadata() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
-    for (id, agent_type) in [
-        ("test-visible-acp", "acp"),
-        ("test-visible-aionrs", "aionrs"),
-        ("test-visible-openclaw", "openclaw-gateway"),
-        ("test-visible-nanobot", "nanobot"),
-        ("test-visible-remote", "remote"),
-        ("test-visible-gemini", "gemini"),
-    ] {
-        upsert_visible_agent_metadata(&services, id, agent_type).await;
-    }
-    services.agent_registry.hydrate().await.unwrap();
-    services.agent_registry.refresh_availability().await;
+    assert!(services.agent_registry.get("f9f61666").await.is_some());
+    assert!(services.agent_registry.get("fb1083a5").await.is_some());
 
     let req = get_with_token("/api/agents/management", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -371,14 +366,12 @@ async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
 
     let body = body_json(resp).await;
     let agents = body["data"].as_array().expect("data should be array");
-    let types: Vec<&str> = agents.iter().filter_map(|agent| agent["agent_type"].as_str()).collect();
+    let ids: Vec<&str> = agents.iter().filter_map(|agent| agent["id"].as_str()).collect();
 
-    assert!(types.contains(&"acp"));
-    assert!(types.contains(&"aionrs"));
-    assert!(types.contains(&"openclaw-gateway"));
-    assert!(types.contains(&"nanobot"));
-    assert!(types.contains(&"remote"));
-    assert!(types.contains(&"gemini"));
+    assert_eq!(ids.len(), 10);
+    assert!(!ids.contains(&"f9f61666"));
+    assert!(!ids.contains(&"fb1083a5"));
+    assert!(ids.contains(&"b7e8a9c4"));
 }
 
 #[tokio::test]
@@ -1016,7 +1009,7 @@ async fn side_question_with_mock_agent() {
 async fn agent_overrides_roundtrip_and_management_summary() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
-    upsert_visible_agent_metadata(&services, "ovr-agent", "acp").await;
+    upsert_visible_agent_metadata(&services, "ovr-agent", "acp", "custom").await;
     services.agent_registry.hydrate().await.unwrap();
     services.agent_registry.refresh_availability().await;
 
@@ -1065,7 +1058,7 @@ async fn agent_overrides_roundtrip_and_management_summary() {
 async fn internal_aion_cli_rejects_overrides() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
-    upsert_visible_agent_metadata(&services, "632f31d2", "aionrs").await;
+    upsert_visible_agent_metadata(&services, "632f31d2", "aionrs", "internal").await;
     services.agent_registry.hydrate().await.unwrap();
     services.agent_registry.refresh_availability().await;
 

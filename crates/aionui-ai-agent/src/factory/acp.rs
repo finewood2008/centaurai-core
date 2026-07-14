@@ -40,6 +40,16 @@ pub(super) async fn build(
     }
     .ok_or_else(|| AgentError::bad_request("ACP agent requires either agent_id or backend in extra"))?;
 
+    // Admission is owned by core and cannot be bypassed by any caller that
+    // reaches the factory (standalone conversations, teams, cron, channels).
+    // Only create the real runtime after a fresh probe succeeds.
+    deps.ensure_agent_startable(&meta.id).await?;
+    let meta = deps
+        .agent_registry
+        .get(&meta.id)
+        .await
+        .ok_or_else(|| AgentError::not_found("Agent disappeared after its admission check"))?;
+
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
     // (custom ACP / remote) to a shared `custom`/`remote` slot string,

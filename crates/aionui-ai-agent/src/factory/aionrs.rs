@@ -82,6 +82,20 @@ pub(super) async fn build(
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
+    if !row.enabled {
+        return Err(AgentError::bad_gateway(format!(
+            "Provider '{provider_id}' is disabled; the agent was not started"
+        )));
+    }
+
+    let aionrs_agent = deps
+        .agent_registry
+        .list_all_including_hidden()
+        .await
+        .into_iter()
+        .find(|agent| agent.agent_type == aionui_common::AgentType::Aionrs)
+        .ok_or_else(|| AgentError::not_found("Built-in AionRS agent is not registered"))?;
+    deps.ensure_agent_startable(&aionrs_agent.id).await?;
 
     let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
         .map_err(|e| AgentError::internal(e.to_string()))?;

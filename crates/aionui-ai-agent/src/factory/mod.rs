@@ -18,6 +18,7 @@ use crate::error::AgentError;
 use crate::factory::context::FactoryContext;
 use crate::persistence::AcpSessionSyncService;
 use crate::registry::AgentRegistry;
+use crate::services::availability::AgentAvailabilityService;
 use crate::session_context::AgentSessionKind;
 use crate::task_manager::AgentFactory;
 use crate::types::BuildTaskOptions;
@@ -40,6 +41,19 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+}
+
+impl AgentFactoryDeps {
+    pub(crate) async fn ensure_agent_startable(&self, agent_id: &str) -> Result<(), AgentError> {
+        AgentAvailabilityService::new(
+            self.agent_registry.clone(),
+            self.provider_repo.clone(),
+            self.data_dir.clone(),
+        )
+        .ensure_session_startable(agent_id)
+        .await
+        .map(|_| ())
+    }
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.

@@ -7,13 +7,13 @@ on:
   workflow_call:
     inputs:
       tag_name:
-        description: "Release tag to build and publish (e.g., v0.2.2)"
+        description: "Release tag to build and publish (e.g., v0.2.3)"
         required: true
         type: string
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to build and publish (e.g., v0.2.2)"
+        description: "Release tag to build and publish (e.g., v0.2.3)"
         required: true
         type: string
 
@@ -50,12 +50,16 @@ jobs:
         shell: bash
         run: |
           version="${RELEASE_TAG#v}"
+          commit="$(git rev-parse HEAD)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
       - name: Verify release contract
         shell: bash
         run: scripts/check-release-contract.sh "${RELEASE_TAG}"
+
+      - name: Test data migration audit tool
+        run: python3 -m unittest scripts/migration/test_audit_data_migration.py
 
   build:
     name: Build ${{ matrix.target }}
@@ -133,6 +137,7 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
+          CENTAURAI_CORE_COMMIT: ${{ needs.prepare-release.outputs.commit }}
           RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: |
           if [[ -n "${RUSTFLAGS:-}" ]]; then

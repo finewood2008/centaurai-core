@@ -193,7 +193,6 @@ impl AppServices {
             Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("centaurai-core")));
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
-
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo: provider_repo.clone(),

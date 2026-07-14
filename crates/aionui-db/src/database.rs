@@ -25,7 +25,15 @@ const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(800),
 ];
 
-static DB_MIGRATOR: Migrator = sqlx::migrate!();
+// Released and development builds can retire experimental migrations after a
+// feature rollback. Keep already-applied, now-missing versions as inert history
+// instead of preventing the database from opening; known migrations still have
+// their checksums validated normally.
+static DB_MIGRATOR: Migrator = {
+    let mut migrator = sqlx::migrate!();
+    migrator.ignore_missing = true;
+    migrator
+};
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;

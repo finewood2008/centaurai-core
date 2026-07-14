@@ -207,7 +207,9 @@ async fn hydrate_refreshes_commandless_managed_builtin_installation() {
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
 
     repo.upsert(&UpsertAgentMetadataParams {
-        id: "agent-managed-cached",
+        // Reuse the curated Claude Code slot: arbitrary builtin IDs are
+        // intentionally retired from management surfaces.
+        id: "2d23ff1c",
         icon: None,
         name: "Managed Cached Agent",
         name_i18n: None,
@@ -235,7 +237,7 @@ async fn hydrate_refreshes_commandless_managed_builtin_installation() {
     .await
     .unwrap();
     repo.update_availability_snapshot(
-        "agent-managed-cached",
+        "2d23ff1c",
         &UpdateAgentAvailabilitySnapshotParams {
             last_check_status: Some("online"),
             last_check_kind: Some("manual"),
@@ -255,7 +257,7 @@ async fn hydrate_refreshes_commandless_managed_builtin_installation() {
     registry.hydrate().await.unwrap();
 
     let rows = registry.list_management_rows().await;
-    let cached = rows.iter().find(|row| row.id == "agent-managed-cached").unwrap();
+    let cached = rows.iter().find(|row| row.id == "2d23ff1c").unwrap();
 
     assert_eq!(cached.status, AgentManagementStatus::Missing);
     assert!(

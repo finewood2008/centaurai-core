@@ -14,6 +14,7 @@ use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, resolve_command_path,
 };
 use tokio::time::Duration;
+use tracing::{info, warn};
 
 use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
@@ -82,6 +83,69 @@ impl AgentAvailabilityService {
         self.management_row_by_id(id)
             .await
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
+    }
+
+    /// Run a fresh, authoritative admission check before an agent runtime is
+    /// created. A cached online snapshot is deliberately not trusted here:
+    /// commands, credentials, providers, and managed runtimes can all change
+    /// between launches.
+    pub async fn ensure_session_startable(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
+        let meta = self
+            .registry
+            .reload_one(id)
+            .await
+            .and_then(|row| row.ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found"))))?;
+
+        if !meta.available {
+            let row = self
+                .management_row_by_id(id)
+                .await
+                .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+            warn!(
+                agent_id = %row.id,
+                agent_name = %row.name,
+                installed = row.installed,
+                status = ?row.status,
+                error_code = row.last_check_error_code.as_deref().unwrap_or("agent_not_installed"),
+                "Agent session admission rejected before launch"
+            );
+            return Err(session_admission_error(&row));
+        }
+
+        let snapshot = run_probe(
+            &self.registry,
+            &self.provider_repo,
+            &meta,
+            &self.data_dir,
+            AgentSnapshotCheckKind::Session,
+        )
+        .await;
+        self.persist_snapshot(id, &snapshot).await?;
+        let row = self
+            .management_row_by_id(id)
+            .await
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+
+        if snapshot.status != "online" {
+            warn!(
+                agent_id = %row.id,
+                agent_name = %row.name,
+                installed = row.installed,
+                status = ?row.status,
+                error_code = row.last_check_error_code.as_deref().unwrap_or("health_check_failed"),
+                latency_ms = snapshot.latency_ms,
+                "Agent session admission rejected after health check"
+            );
+            return Err(session_admission_error(&row));
+        }
+
+        info!(
+            agent_id = %row.id,
+            agent_name = %row.name,
+            latency_ms = snapshot.latency_ms,
+            "Agent session admission health check passed"
+        );
+        Ok(row)
     }
 
     pub async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
@@ -153,6 +217,24 @@ impl AgentAvailabilityService {
         self.registry.reload_one(id).await?;
         Ok(())
     }
+}
+
+fn session_admission_error(row: &AgentManagementRow) -> AgentError {
+    let code = row.last_check_error_code.as_deref().unwrap_or(if row.installed {
+        "health_check_failed"
+    } else {
+        "agent_not_installed"
+    });
+    let guidance = row
+        .last_check_guidance
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default();
+    AgentError::bad_gateway(format!(
+        "Agent '{}' is unavailable and was not started ({code}).{guidance}",
+        row.name
+    ))
 }
 
 async fn run_probe(
@@ -418,6 +500,104 @@ mod tests {
 
         assert_eq!(status, AgentSnapshotCheckStatus::Online);
         assert!(code.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_admission_rejects_failed_probe_and_persists_offline_status() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
+        let agent_id = registry
+            .list_all_including_hidden()
+            .await
+            .into_iter()
+            .find(|agent| agent.agent_type == AgentType::Aionrs)
+            .unwrap()
+            .id;
+
+        let error = service.ensure_session_startable(&agent_id).await.unwrap_err();
+
+        assert!(error.to_string().contains("no_provider"));
+        let row = service.management_row_by_id(&agent_id).await.unwrap();
+        assert!(row.installed);
+        assert_eq!(row.status, AgentManagementStatus::Offline);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::Offline));
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Session));
+        assert_eq!(row.last_check_error_code.as_deref(), Some("no_provider"));
+    }
+
+    #[tokio::test]
+    async fn session_admission_accepts_fresh_successful_probe() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        provider_repo.create(enabled_provider_params()).await.unwrap();
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo, std::env::temp_dir());
+        let agent_id = registry
+            .list_all_including_hidden()
+            .await
+            .into_iter()
+            .find(|agent| agent.agent_type == AgentType::Aionrs)
+            .unwrap()
+            .id;
+
+        let row = service.ensure_session_startable(&agent_id).await.unwrap();
+
+        assert!(row.installed);
+        assert_eq!(row.status, AgentManagementStatus::Online);
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::Online));
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Session));
+        assert!(row.last_check_error_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_admission_rejects_uninstalled_agent_before_launch() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        repo.upsert(&UpsertAgentMetadataParams {
+            id: "agent-not-installed",
+            icon: None,
+            name: "Not Installed Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("custom"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"definitely-not-installed-agent"}"#),
+            enabled: true,
+            command: Some("definitely-not-installed-agent"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        })
+        .await
+        .unwrap();
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry, provider_repo, std::env::temp_dir());
+
+        let error = service
+            .ensure_session_startable("agent-not-installed")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("command_missing"));
     }
 
     #[tokio::test]

@@ -107,6 +107,33 @@ async fn migrations_applied() {
     assert!(count.0 >= 1, "at least one migration should be applied");
 }
 
+#[tokio::test]
+async fn retired_experimental_migration_history_does_not_block_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+
+    let db = init_database(&path).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations \
+         (version, description, success, checksum, execution_time) \
+         VALUES (27, 'retired experimental migration', 1, X'00', 0)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.close().await;
+
+    let reopened = init_database(&path)
+        .await
+        .expect("retired migration history should remain inert");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 27")
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1, "retired migration history must be preserved");
+    reopened.close().await;
+}
+
 // -- T1.5 System default user --
 
 #[tokio::test]

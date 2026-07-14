@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.3](https://github.com/finewood2008/centaurai-core/compare/v0.2.2...v0.2.3) (2026-07-14)
+
+### Reliability and compatibility
+
+- Agent runtimes now perform a fresh authoritative availability check before
+  every ACP or AionRS session starts, reject disabled Providers, and persist
+  actionable health diagnostics instead of launching a known-broken runtime.
+- Agent management exposes the ten supported official runtimes first while
+  retaining retired builtin metadata for historical conversation resolution;
+  custom and extension agents remain visible alongside the official catalog.
+- Databases created by development builds can retain withdrawn experimental
+  migration records without blocking startup. Released migrations continue to
+  enforce their normal checksum validation, and retired history is preserved.
+- Release builds now stamp the exact source commit reliably across worktrees,
+  and CI exercises the isolated data-migration audit tool before publishing.
+
 ## [0.2.2](https://github.com/finewood2008/centaurai-core/compare/v0.2.1...v0.2.2) (2026-07-12)
 
 ### Features

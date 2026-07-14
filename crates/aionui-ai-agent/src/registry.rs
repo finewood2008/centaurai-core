@@ -41,6 +41,24 @@ use crate::manager::acp::config_option_catalog::{
 /// before producers start to back off.
 const CATALOG_SYNC_CHANNEL_CAPACITY: usize = 256;
 
+/// Stable official catalog exposed for new sessions and management surfaces.
+///
+/// Retired builtin rows remain hydrated so historical conversations can still
+/// resolve their original agent IDs. Extension and custom rows are user-owned
+/// additions and therefore remain visible outside this official set.
+const CURATED_OFFICIAL_AGENT_IDS: [&str; 10] = [
+    "632f31d2", // CentaurAI Core
+    "2d23ff1c", // Claude Code
+    "8e1acf31", // Codex CLI
+    "cc126dd5", // Gemini CLI
+    "8b20fd41", // CodeBuddy
+    "e241c49c", // Kimi
+    "26a946ed", // Qwen
+    "1e4afc51", // Qoder
+    "55f3ed1c", // Hermes
+    "b7e8a9c4", // OpenClaw ACP
+];
+
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
 struct CatalogSyncMessage {
@@ -215,7 +233,10 @@ impl AgentRegistry {
         // Snapshot the summary off the local map before transferring it
         // into the lock — `log_availability_summary` borrows the values
         // and we don't want that borrow to outlive the move.
-        log_availability_summary(map.values(), "AgentRegistry hydrated");
+        log_availability_summary(
+            map.values().filter(|meta| is_catalog_member(meta)),
+            "AgentRegistry hydrated",
+        );
         *self.by_id.write().await = map;
         *self.unavailable_reasons.write().await = reasons;
         Ok(())
@@ -226,7 +247,7 @@ impl AgentRegistry {
     pub async fn refresh_availability(&self) {
         let mut guard = self.by_id.write().await;
         let mut reasons = HashMap::new();
-        for meta in guard.values_mut() {
+        for meta in guard.values_mut().filter(|meta| is_catalog_member(meta)) {
             let (path, reason) = probe_with_reason(meta);
             meta.resolved_command = path;
             meta.available = meta.resolved_command.is_some() || is_internal_commandless_agent(meta);
@@ -236,7 +257,10 @@ impl AgentRegistry {
                 reasons.insert(meta.id.clone(), reason);
             }
         }
-        log_availability_summary(guard.values(), "AgentRegistry refresh_availability complete");
+        log_availability_summary(
+            guard.values().filter(|meta| is_catalog_member(meta)),
+            "AgentRegistry refresh_availability complete",
+        );
         *self.unavailable_reasons.write().await = reasons;
     }
 
@@ -311,10 +335,9 @@ impl AgentRegistry {
         rows
     }
 
-    /// Unfiltered snapshot — used by internal paths that legitimately
-    /// need to see user-disabled or missing rows (e.g. the UI's
-    /// "manage agents" surface). Keep external API handlers on
-    /// [`Self::list_all`].
+    /// Compatibility snapshot including retired official rows. Internal paths
+    /// use this for historical conversation resolution and logo lookup. New
+    /// session and management surfaces must use the curated list methods.
     pub async fn list_all_including_hidden(&self) -> Vec<AgentMetadata> {
         let mut rows: Vec<AgentMetadata> = self.by_id.read().await.values().cloned().collect();
         rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
@@ -330,10 +353,12 @@ impl AgentRegistry {
             .read()
             .await
             .values()
+            .filter(|meta| is_catalog_member(meta))
             .cloned()
             .map(|meta| {
                 let reason = reasons.get(&meta.id);
                 let status = derive_management_status(&meta, reason);
+                let installed = derive_management_installed(&meta);
                 let diagnostics = derive_management_diagnostics(&meta, status, reason);
                 let handshake = meta.handshake;
                 AgentManagementRow {
@@ -348,7 +373,7 @@ impl AgentRegistry {
                     agent_source: meta.agent_source,
                     agent_source_info: meta.agent_source_info,
                     enabled: meta.enabled,
-                    installed: meta.available,
+                    installed,
                     command: meta.command,
                     args: meta.args,
                     env: Vec::new(),
@@ -377,7 +402,15 @@ impl AgentRegistry {
                 }
             })
             .collect();
-        rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
+        // Agent management is installation-first: rows whose runtime can be
+        // resolved belong to the detected/installed group, while missing or
+        // disabled rows stay visible after it for diagnostics and setup.
+        rows.sort_by(|a, b| {
+            b.installed
+                .cmp(&a.installed)
+                .then_with(|| a.sort_order.cmp(&b.sort_order))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         rows
     }
 
@@ -385,6 +418,7 @@ impl AgentRegistry {
         let reason = self.unavailable_reasons.read().await.get(id).cloned();
         let meta = self.by_id.read().await.get(id).cloned()?;
         let status = derive_management_status(&meta, reason.as_ref());
+        let installed = derive_management_installed(&meta);
         let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
         let handshake = meta.handshake.clone();
         Some(AgentManagementRow {
@@ -399,7 +433,7 @@ impl AgentRegistry {
             agent_source: meta.agent_source,
             agent_source_info: meta.agent_source_info,
             enabled: meta.enabled,
-            installed: meta.available,
+            installed,
             command: meta.command,
             args: meta.args,
             env: Vec::new(),
@@ -447,6 +481,7 @@ impl AgentRegistry {
             .read()
             .await
             .values()
+            .filter(|meta| is_catalog_member(meta))
             .map(|m| {
                 let reason = if m.available { None } else { reasons.get(&m.id).cloned() };
                 (m.clone(), reason)
@@ -470,7 +505,14 @@ impl AgentRegistry {
 /// keeps both uninstalled CLIs and rows that most recently failed
 /// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
-    meta.enabled && matches!(derive_management_status(meta, None), AgentManagementStatus::Online)
+    is_catalog_member(meta)
+        && meta.enabled
+        && matches!(derive_management_status(meta, None), AgentManagementStatus::Online)
+}
+
+fn is_catalog_member(meta: &AgentMetadata) -> bool {
+    matches!(meta.agent_source, AgentSource::Custom | AgentSource::Extension)
+        || CURATED_OFFICIAL_AGENT_IDS.contains(&meta.id.as_str())
 }
 
 /// Extract and trim a command override, filtering out empty strings.
@@ -863,7 +905,7 @@ fn derive_management_status(meta: &AgentMetadata, reason: Option<&UnavailableRea
         }
         return AgentManagementStatus::Unchecked;
     }
-    if is_internal_commandless_agent(meta) {
+    if is_internal_commandless_agent(meta) && meta.last_check_status.is_none() {
         return AgentManagementStatus::Online;
     }
 
@@ -872,6 +914,19 @@ fn derive_management_status(meta: &AgentMetadata, reason: Option<&UnavailableRea
         Some(AgentSnapshotCheckStatus::Online) => AgentManagementStatus::Online,
         None => AgentManagementStatus::Unchecked,
     }
+}
+
+/// Installation and enablement are separate management concerns. Registry
+/// availability intentionally becomes false for disabled rows, but disabling
+/// an agent must not make an installed CLI appear uninstalled in settings.
+fn derive_management_installed(meta: &AgentMetadata) -> bool {
+    if meta.enabled {
+        return meta.available;
+    }
+
+    let mut enabled_candidate = meta.clone();
+    enabled_candidate.enabled = true;
+    is_internal_commandless_agent(&enabled_candidate) || probe_resolved_command(&enabled_candidate).is_ok()
 }
 
 struct ManagementDiagnostics {
@@ -1249,6 +1304,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_catalog_exposes_only_curated_official_agents() {
+        let reg = registry().await;
+        let rows = reg.list_management_rows().await;
+        let ids = rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let expected = CURATED_OFFICIAL_AGENT_IDS
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(rows.len(), 10);
+        assert_eq!(ids, expected);
+        assert!(rows.iter().any(|row| row.name == "CodeBuddy"));
+        assert!(rows.iter().any(|row| row.name == "Kimi"));
+        assert!(rows.iter().any(|row| row.name == "Qwen"));
+        assert!(rows.iter().any(|row| row.name == "Qoder"));
+        assert!(rows.iter().any(|row| row.name == "Hermes"));
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "OpenClaw" && row.agent_type == AgentType::Acp)
+        );
+        assert!(!rows.iter().any(|row| row.agent_type == AgentType::OpenclawGateway));
+    }
+
+    #[tokio::test]
+    async fn retired_agent_metadata_remains_available_for_historical_resolution() {
+        let reg = registry().await;
+
+        assert!(
+            reg.get("53861a53").await.is_some(),
+            "retired OpenCode row must stay hydrated"
+        );
+        assert!(
+            reg.find_builtin_by_backend("opencode").await.is_some(),
+            "historical backend lookup must continue to resolve retired agents"
+        );
+        assert!(
+            reg.list_all_including_hidden()
+                .await
+                .iter()
+                .any(|agent| agent.id == "53861a53"),
+            "compatibility snapshot must retain retired rows"
+        );
+        assert!(
+            reg.list_management_rows()
+                .await
+                .iter()
+                .all(|agent| agent.id != "53861a53"),
+            "retired rows must not reappear in management"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_agents_are_added_outside_the_ten_official_slots() {
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        repo.upsert(&aionui_db::UpsertAgentMetadataParams {
+            id: "custom-eleventh",
+            icon: None,
+            name: "Custom Eleventh",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("custom-eleventh"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"missing-custom-eleventh"}"#),
+            enabled: true,
+            command: Some("missing-custom-eleventh"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 9_999,
+        })
+        .await
+        .unwrap();
+        let reg = AgentRegistry::new(repo);
+        reg.hydrate().await.unwrap();
+        let rows = reg.list_management_rows().await;
+
+        assert_eq!(rows.len(), 11);
+        assert!(rows.iter().any(|row| row.id == "custom-eleventh"));
+    }
+
+    #[tokio::test]
     async fn find_builtin_claude_uses_managed_acp_runtime_metadata() {
         let reg = registry().await;
         let m = reg.find_builtin_by_backend("claude").await.unwrap();
@@ -1427,7 +1576,12 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 21, "every row appears once");
+        assert_eq!(
+            snapshot.len(),
+            10,
+            "only curated official rows appear in catalog diagnostics"
+        );
+        assert!(snapshot.iter().all(|(meta, _)| is_catalog_member(meta)));
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {

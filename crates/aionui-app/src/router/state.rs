@@ -1061,9 +1061,10 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    fn capturing_worker_task_manager(
-        captured_env: Arc<Mutex<Vec<Vec<(String, String)>>>>,
-    ) -> Arc<dyn IWorkerTaskManager> {
+    type RuntimeEnv = Vec<(String, String)>;
+    type CapturedRuntimeEnvs = Arc<Mutex<Vec<RuntimeEnv>>>;
+
+    fn capturing_worker_task_manager(captured_env: CapturedRuntimeEnvs) -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(move |opts: BuildTaskOptions| {
             let captured_env = captured_env.clone();
             Box::pin(async move {
@@ -1080,7 +1081,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    async fn wait_for_captured_env(captured_env: &Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Vec<(String, String)> {
+    async fn wait_for_captured_env(captured_env: &CapturedRuntimeEnvs) -> RuntimeEnv {
         for _ in 0..50 {
             if let Some(env) = captured_env.lock().unwrap().first().cloned() {
                 return env;
