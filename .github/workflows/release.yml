@@ -91,14 +91,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: centaurai-core
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary_name: centaurai-core.exe
-            rustflags: "-C target-feature=+crt-static"
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            binary_name: centaurai-core.exe
-            rustflags: "-C target-feature=+crt-static"
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -304,8 +296,8 @@ jobs:
                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                   "size": path.stat().st_size,
               }
-          if len(assets) != 6:
-              raise SystemExit(f"expected six platform assets, found {len(assets)}")
+          if len(assets) != 4:
+              raise SystemExit(f"expected four platform assets, found {len(assets)}")
           capabilities_path = Path("centaurai-core-capabilities.json")
           if not capabilities_path.is_file():
               raise SystemExit("missing capabilities captured from the Linux x64 release binary")
